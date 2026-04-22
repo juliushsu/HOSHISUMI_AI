@@ -1,0 +1,1 @@
+# HOSHISUMI_AI
