@@ -463,16 +463,7 @@ function toRecentLeadPreview(row) {
   };
 }
 
-router.get('/overview', async (req, res) => {
-  const { supabase, auth } = req;
-  const organizationId = scopedOrganizationId(auth);
-  const scope = await resolveStoreScope({
-    supabase,
-    auth,
-    requestedStoreId: req.query.store_id
-  });
-  if (!scope.ok) return respondError(res, scope.status, scope.code, scope.message, scope.details ?? null);
-
+async function fetchStorefrontOverviewData({ supabase, auth, organizationId, storeId }) {
   const todayStartIso = getUtcDayStart().toISOString();
   const weekStartIso = getUtcWeekStart().toISOString();
 
@@ -481,31 +472,31 @@ router.get('/overview', async (req, res) => {
       supabase,
       auth,
       organizationId,
-      storeId: scope.store.id
+      storeId
     }).gte('created_at', todayStartIso),
     buildScopedLeadsCountQuery({
       supabase,
       auth,
       organizationId,
-      storeId: scope.store.id
+      storeId
     }).gte('created_at', weekStartIso),
     buildScopedLeadsCountQuery({
       supabase,
       auth,
       organizationId,
-      storeId: scope.store.id
+      storeId
     }).eq('status', 'new'),
     buildScopedLeadsCountQuery({
       supabase,
       auth,
       organizationId,
-      storeId: scope.store.id
+      storeId
     }).eq('status', 'contacted'),
     buildScopedLeadsCountQuery({
       supabase,
       auth,
       organizationId,
-      storeId: scope.store.id
+      storeId
     }).eq('status', 'qualified')
   ];
 
@@ -514,7 +505,7 @@ router.get('/overview', async (req, res) => {
       supabase,
       auth,
       organizationId,
-      storeId: scope.store.id
+      storeId
     }).eq('source_type', sourceType)
   );
 
@@ -524,7 +515,7 @@ router.get('/overview', async (req, res) => {
       'id,customer_name,source_type,status,created_at,agent_id,property_id,agent:agents!leads_agent_id_fkey(id,name),property:properties!leads_property_id_fkey(id,title)'
     )
     .eq('organization_id', organizationId)
-    .eq('store_id', scope.store.id)
+    .eq('store_id', storeId)
     .order('created_at', { ascending: false })
     .limit(5);
   recentQuery = applyDemoReadScope(recentQuery, auth, 'organization_id');
@@ -538,17 +529,14 @@ router.get('/overview', async (req, res) => {
   const metricError = metricResults.find((result) => result.error);
   const sourceError = sourceResults.find((result) => result.error);
   if (metricError || sourceError || recentResult.error) {
-    return respondError(
-      res,
-      500,
-      'STOREFRONT_OVERVIEW_FETCH_FAILED',
-      'Failed to fetch storefront overview metrics.',
-      {
+    return {
+      ok: false,
+      details: {
         metrics_error: metricError?.error?.message ?? null,
         source_breakdown_error: sourceError?.error?.message ?? null,
         recent_error: recentResult.error?.message ?? null
       }
-    );
+    };
   }
 
   const sourceTypeBreakdown = LEAD_SOURCE_TYPES.map((sourceType, index) => ({
@@ -556,9 +544,9 @@ router.get('/overview', async (req, res) => {
     count: Number(sourceResults[index]?.count ?? 0)
   }));
 
-  return respondOk(
-    res,
-    {
+  return {
+    ok: true,
+    overview: {
       today_leads_count: Number(metricResults[0]?.count ?? 0),
       week_leads_count: Number(metricResults[1]?.count ?? 0),
       new_leads_count: Number(metricResults[2]?.count ?? 0),
@@ -567,13 +555,143 @@ router.get('/overview', async (req, res) => {
       source_type_breakdown: sourceTypeBreakdown,
       recent_leads_preview: (recentResult.data ?? []).map(toRecentLeadPreview)
     },
+    periodAnchor: {
+      day_start_utc: todayStartIso,
+      week_start_utc: weekStartIso
+    }
+  };
+}
+
+function toStorefrontStats(overview) {
+  return {
+    new: overview.new_leads_count,
+    contacted: overview.contacted_leads_count,
+    qualified: overview.qualified_leads_count,
+    today: overview.today_leads_count,
+    week: overview.week_leads_count
+  };
+}
+
+router.get('/', async (req, res) => {
+  const { supabase, auth } = req;
+  const organizationId = scopedOrganizationId(auth);
+  const scope = await resolveStoreScope({
+    supabase,
+    auth,
+    requestedStoreId: req.query.store_id
+  });
+  if (!scope.ok) return respondError(res, scope.status, scope.code, scope.message, scope.details ?? null);
+
+  const [overviewResult, servicesResult, propertiesResult] = await Promise.all([
+    fetchStorefrontOverviewData({
+      supabase,
+      auth,
+      organizationId,
+      storeId: scope.store.id
+    }),
+    supabase
+      .from('store_services')
+      .select(STORE_SERVICE_SELECT)
+      .eq('store_id', scope.store.id)
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: true }),
+    supabase
+      .from('store_property_publications')
+      .select(STORE_PROPERTY_PUBLICATION_SELECT)
+      .eq('store_id', scope.store.id)
+      .order('display_order', { ascending: true })
+      .order('updated_at', { ascending: false })
+  ]);
+
+  if (!overviewResult.ok) {
+    return respondError(
+      res,
+      500,
+      'STOREFRONT_OVERVIEW_FETCH_FAILED',
+      'Failed to fetch storefront overview metrics.',
+      overviewResult.details
+    );
+  }
+
+  if (servicesResult.error) {
+    return respondError(res, 500, 'STOREFRONT_SERVICES_FETCH_FAILED', 'Failed to fetch storefront services.', {
+      supabase_error: servicesResult.error.message
+    });
+  }
+
+  if (propertiesResult.error) {
+    return respondError(
+      res,
+      500,
+      'STOREFRONT_PUBLICATIONS_FETCH_FAILED',
+      'Failed to fetch storefront property publications.',
+      { supabase_error: propertiesResult.error.message }
+    );
+  }
+
+  const profile = toStoreProfileAdminDto(scope.store);
+  const overview = overviewResult.overview;
+  const stats = toStorefrontStats(overview);
+  const services = (servicesResult.data ?? []).map(toStoreServiceAdminDto);
+  const properties = (propertiesResult.data ?? []).map(toStorePropertyPublicationAdminDto);
+
+  return respondOk(
+    res,
+    {
+      profile,
+      store: profile,
+      dashboard: {
+        stats,
+        overview,
+        source_type_breakdown: overview.source_type_breakdown,
+        recent_leads_preview: overview.recent_leads_preview
+      },
+      stats,
+      services,
+      properties
+    },
     200,
     {
       store_scope: { store_id: scope.store.id, mode: scope.scope_mode },
-      period_anchor: {
-        day_start_utc: todayStartIso,
-        week_start_utc: weekStartIso
-      }
+      period_anchor: overviewResult.periodAnchor
+    }
+  );
+});
+
+router.get('/overview', async (req, res) => {
+  const { supabase, auth } = req;
+  const organizationId = scopedOrganizationId(auth);
+  const scope = await resolveStoreScope({
+    supabase,
+    auth,
+    requestedStoreId: req.query.store_id
+  });
+  if (!scope.ok) return respondError(res, scope.status, scope.code, scope.message, scope.details ?? null);
+
+  const overviewResult = await fetchStorefrontOverviewData({
+    supabase,
+    auth,
+    organizationId,
+    storeId: scope.store.id
+  });
+
+  if (!overviewResult.ok) {
+    return respondError(
+      res,
+      500,
+      'STOREFRONT_OVERVIEW_FETCH_FAILED',
+      'Failed to fetch storefront overview metrics.',
+      overviewResult.details
+    );
+  }
+
+  return respondOk(
+    res,
+    overviewResult.overview,
+    200,
+    {
+      store_scope: { store_id: scope.store.id, mode: scope.scope_mode },
+      period_anchor: overviewResult.periodAnchor
     }
   );
 });
