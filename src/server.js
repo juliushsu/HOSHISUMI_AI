@@ -127,7 +127,7 @@ app.use('/api/admin/properties', requireAuth, adminPropertiesRouter);
 app.use('/api/admin/import-batches', requireAuth, adminImportBatchesRouter);
 app.use('/api/admin/intake-cases', requireAuth, adminIntakeCasesRouter);
 app.use('/api/admin/property-ingest/jobs', requireAuth, adminPropertyIngestJobsRouter);
-app.use('/api/admin/ai-assistant', requireStagingFeature, requireAuth, adminAiAssistantRouter);
+app.use('/api/admin/ai-assistant', requireStagingFeature, express.json({ limit: '1mb' }), requireAuth, adminAiAssistantRouter);
 console.log('admin ai assistant route mounted', {
   path: '/api/admin/ai-assistant',
   build_marker: buildMarker,

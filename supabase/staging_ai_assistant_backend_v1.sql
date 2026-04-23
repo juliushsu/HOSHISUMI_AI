@@ -297,13 +297,13 @@ begin
     p_default_limit,
     (p_period_month + interval '1 month')::timestamptz
   )
-  on conflict (organization_id, period_month) do nothing;
+  on conflict on constraint ai_usage_quotas_org_period_unique do nothing;
 
   select *
   into quota_row
-  from public.ai_usage_quotas
-  where organization_id = p_organization_id
-    and period_month = p_period_month;
+  from public.ai_usage_quotas as quota
+  where quota.organization_id = p_organization_id
+    and quota.period_month = p_period_month;
 
   return query
   select
