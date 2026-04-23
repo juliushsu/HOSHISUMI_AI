@@ -19,6 +19,7 @@ import adminPropertiesRouter from './routes/adminProperties.js';
 import adminImportBatchesRouter from './routes/adminImportBatches.js';
 import adminIntakeCasesRouter from './routes/adminIntakeCases.js';
 import adminPropertyIngestJobsRouter from './routes/adminPropertyIngestJobs.js';
+import adminAiAssistantRouter from './routes/adminAiAssistant.js';
 import publicInquiriesRouter from './routes/publicInquiries.js';
 import adminInquiriesRouter from './routes/adminInquiries.js';
 import { requireAuth } from './middleware/auth.js';
@@ -45,6 +46,13 @@ function isAllowedOrigin(origin) {
   if (!origin) return allowNoOrigin;
   if (allowedOrigins.includes(origin)) return true;
   return allowedOriginSuffixes.some((suffix) => origin.endsWith(suffix));
+}
+
+function requireStagingFeature(_req, res, next) {
+  if (!isStaging) {
+    return respondError(res, 404, 'STAGING_FEATURE_NOT_FOUND', 'Route is available in staging only.');
+  }
+  return next();
 }
 
 const corsOptions = {
@@ -113,6 +121,7 @@ app.use('/api/admin/properties', requireAuth, adminPropertiesRouter);
 app.use('/api/admin/import-batches', requireAuth, adminImportBatchesRouter);
 app.use('/api/admin/intake-cases', requireAuth, adminIntakeCasesRouter);
 app.use('/api/admin/property-ingest/jobs', requireAuth, adminPropertyIngestJobsRouter);
+app.use('/api/admin/ai-assistant', requireStagingFeature, requireAuth, adminAiAssistantRouter);
 app.use('/api/clients', requireAuth, clientsRouter);
 app.use('/api/properties', requireAuth, propertiesRouter);
 app.use('/api/partners', requireAuth, partnersRouter);
