@@ -362,7 +362,11 @@ router.post('/analyses', async (req, res) => {
   const forceRegenerate = Boolean(body.force_regenerate);
 
   if (!isUuid(propertyId)) {
-    return respondError(res, 400, 'INVALID_PROPERTY_ID', 'property_id must be a UUID.');
+    return respondError(res, 400, 'INVALID_PROPERTY_ID', 'property_id must be a UUID.', {
+      received_property_id: propertyId ?? null,
+      body_type: Array.isArray(body) ? 'array' : typeof body,
+      body_keys: isPlainObject(body) ? Object.keys(body) : []
+    });
   }
 
   const propertyResult = await fetchProperty(req, propertyId);
@@ -474,7 +478,11 @@ router.post('/copy-generations', async (req, res) => {
   const promptContext = normalizeOptionalObject(body.prompt_context, {});
 
   if (!isUuid(propertyId)) {
-    return respondError(res, 400, 'INVALID_PROPERTY_ID', 'property_id must be a UUID.');
+    return respondError(res, 400, 'INVALID_PROPERTY_ID', 'property_id must be a UUID.', {
+      received_property_id: propertyId ?? null,
+      body_type: Array.isArray(body) ? 'array' : typeof body,
+      body_keys: isPlainObject(body) ? Object.keys(body) : []
+    });
   }
   if (analysisId && !isUuid(analysisId)) {
     return respondError(res, 400, 'INVALID_ANALYSIS_ID', 'analysis_id must be a UUID.');
