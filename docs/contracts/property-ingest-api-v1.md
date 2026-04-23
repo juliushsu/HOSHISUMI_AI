@@ -5,7 +5,7 @@
 
 ## Canonical Flow
 
-`upload file -> run OCR -> translate to zh-TW fields -> human review -> approve -> create canonical property`
+`upload file -> run OCR -> choose strategy -> translate/extract -> human review -> approve -> create canonical property`
 
 ## Governance
 
@@ -15,6 +15,7 @@
 - demo org 不可用此 flow
 - 所有 AI raw output 必須保留 `raw_json`
 - approve 前後變更由 `property_review_decisions` append-only 保留
+- staging V1 先做策略式 routing，不做 queue system
 
 ## Tables
 
@@ -29,12 +30,23 @@
 - `uploaded`
 - `ocr_processing`
 - `ocr_done`
+- `ocr_low_confidence`
 - `translating`
+- `vision_fallback_processing`
 - `translated`
 - `pending_review`
 - `approved`
 - `rejected`
 - `failed`
+
+## Processing Strategies
+
+- `ocr_then_ai`
+  - OCR 品質足夠，直接用 OCR text 做欄位翻譯/抽取
+- `hybrid_assist`
+  - OCR 有部分文字，但 coverage/confidence 不夠，改成 OCR text + image vision assist
+- `vision_only_fallback`
+  - OCR 幾乎無法用時，直接走 image vision fallback
 
 ## OCR Provider Interface
 
@@ -43,9 +55,14 @@ ocrProvider.extractText({ buffer, mimeType, fileName }) => {
   status,
   provider,
   model,
+  processingStrategy,
   rawText,
   blocks,
   confidence,
+  keyFieldCoverage,
+  recommendedNextStep,
+  tokenUsage,
+  estimatedCostUsd,
   rawJson,
   errorCode,
   errorMessage
@@ -55,12 +72,42 @@ ocrProvider.extractText({ buffer, mimeType, fileName }) => {
 ## Translator Provider Interface
 
 ```js
-translatorProvider.translatePropertyFields({ rawTextJa, blocks }) => {
+translatorProvider.translatePropertyFields({ rawTextJa, blocks, processingStrategy }) => {
   status,
   provider,
   model,
+  processingStrategy,
   translatedFields,
+  keyFieldCoverage,
   confidence,
+  tokenUsage,
+  estimatedCostUsd,
+  rawJson,
+  errorCode,
+  errorMessage
+}
+```
+
+## Vision Property Provider Interface
+
+```js
+visionPropertyProvider.extractAndTranslate({
+  buffer,
+  mimeType,
+  fileName,
+  rawTextJa,
+  blocks,
+  processingStrategy
+}) => {
+  status,
+  provider,
+  model,
+  processingStrategy,
+  translatedFields,
+  keyFieldCoverage,
+  confidence,
+  tokenUsage,
+  estimatedCostUsd,
   rawJson,
   errorCode,
   errorMessage
@@ -131,6 +178,7 @@ query:
 - `page`
 - `limit`
 - `status?`
+- `processing_strategy?`
 - `store_id?`
 - `search?`
 
@@ -141,18 +189,22 @@ response:
   "data": [
     {
       "id": "uuid",
-      "status": "translated",
+      "status": "ocr_low_confidence",
       "ocr_status": "done",
-      "translation_status": "done",
-      "raw_file_name": "sheet.jpg",
-      "created_at": "ISO",
-      "updated_at": "ISO",
+      "translation_status": "pending",
+      "processing_strategy": null,
+      "recommended_next_step": "hybrid_assist",
+      "key_field_coverage": {
+        "coverage_ratio": 0.4286
+      },
+      "current_ocr_confidence": 0.41,
+      "estimated_cost_usd": null,
       "preview": {
-        "title_zh": "東京XX公寓",
-        "address_zh": "東京都...",
-        "rent": 120000,
-        "area": 41.8,
-        "layout": "1LDK"
+        "title_zh": null,
+        "address_zh": null,
+        "rent": null,
+        "area": null,
+        "layout": null
       }
     }
   ],
@@ -173,7 +225,18 @@ response:
 ```json
 {
   "data": {
-    "job": {},
+    "job": {
+      "processing_strategy": null,
+      "recommended_next_step": "ocr_then_ai",
+      "key_field_coverage": {},
+      "current_ocr_confidence": 0.88,
+      "token_usage": {
+        "input_tokens": 1200,
+        "output_tokens": 280,
+        "total_tokens": 1480
+      },
+      "estimated_cost_usd": null
+    },
     "files": [],
     "ocr_result": {},
     "translation_result": {},
@@ -207,7 +270,21 @@ response:
 {
   "data": {
     "job_id": "uuid",
-    "status": "ocr_done",
+    "status": "ocr_low_confidence",
+    "ocr_confidence": 0.41,
+    "key_field_coverage": {
+      "title_or_building_name": false,
+      "address": true,
+      "rent_or_price": true,
+      "area_sqm": false,
+      "layout": false,
+      "station_access": true,
+      "building_age": false,
+      "matched_count": 3,
+      "total_fields": 7,
+      "coverage_ratio": 0.4286
+    },
+    "recommended_next_step": "hybrid_assist",
     "ocr_result": {
       "id": "uuid",
       "status": "done",
@@ -227,6 +304,7 @@ request:
 ```json
 {
   "force_rerun": false,
+  "strategy": "hybrid_assist",
   "store_id": null
 }
 ```
@@ -238,13 +316,21 @@ response:
   "data": {
     "job_id": "uuid",
     "status": "translated",
+    "processing_strategy": "hybrid_assist",
     "translation_result": {
       "id": "uuid",
       "status": "done",
-      "provider": "openai_property_translator",
+      "provider": "openai_property_vision",
+      "processing_strategy": "hybrid_assist",
       "translated_fields_json": {
         "title_zh": "東京XX公寓"
-      }
+      },
+      "token_usage": {
+        "input_tokens": 1400,
+        "output_tokens": 320,
+        "total_tokens": 1720
+      },
+      "estimated_cost_usd": null
     }
   },
   "error": null,
@@ -268,25 +354,6 @@ request:
 }
 ```
 
-response:
-
-```json
-{
-  "data": {
-    "job_id": "uuid",
-    "status": "pending_review",
-    "review_decision": {
-      "id": "uuid",
-      "decision": "reviewed",
-      "status_before": "translated",
-      "status_after": "pending_review"
-    }
-  },
-  "error": null,
-  "meta": null
-}
-```
-
 ## 7) POST /api/admin/property-ingest/jobs/:id/approve
 
 request:
@@ -298,25 +365,26 @@ request:
 }
 ```
 
-response:
+## Cost / Token Logging Proposal
 
-```json
-{
-  "data": {
-    "job_id": "uuid",
-    "status": "approved",
-    "approved_property": {
-      "id": "uuid",
-      "title": "東京XX公寓",
-      "title_zh": "東京XX公寓",
-      "address_zh": "東京都...",
-      "price": 120000
-    }
-  },
-  "error": null,
-  "meta": null
-}
-```
+最小可用方案：
+- 每次 OCR / translation / vision provider call 都記錄：
+  - `token_input_count`
+  - `token_output_count`
+  - `token_total_count`
+  - `estimated_cost_usd`
+- job table 聚合總 token / cost，方便比較：
+  - `ocr_then_ai`
+  - `hybrid_assist`
+  - `vision_only_fallback`
+- `estimated_cost_usd` 採 env-based pricing：
+  - `PROPERTY_INGEST_OCR_INPUT_COST_PER_1M`
+  - `PROPERTY_INGEST_OCR_OUTPUT_COST_PER_1M`
+  - `PROPERTY_INGEST_TRANSLATOR_INPUT_COST_PER_1M`
+  - `PROPERTY_INGEST_TRANSLATOR_OUTPUT_COST_PER_1M`
+  - `PROPERTY_INGEST_VISION_INPUT_COST_PER_1M`
+  - `PROPERTY_INGEST_VISION_OUTPUT_COST_PER_1M`
+- 若未配置 pricing env，token 仍照常記錄，`estimated_cost_usd` 可為 `null`
 
 ## Canonical Property Mapping Proposal
 

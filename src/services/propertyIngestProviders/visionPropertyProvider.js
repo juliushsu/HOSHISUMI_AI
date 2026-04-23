@@ -8,8 +8,8 @@ import {
 } from './strategyUtils.js';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const TRANSLATOR_PROVIDER = String(process.env.PROPERTY_INGEST_TRANSLATOR_PROVIDER || '').trim().toLowerCase();
-const OPENAI_MODEL = process.env.PROPERTY_INGEST_TRANSLATOR_MODEL || process.env.PROPERTY_INTAKE_PARSE_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+const VISION_PROVIDER = String(process.env.PROPERTY_INGEST_VISION_PROVIDER || '').trim().toLowerCase();
+const OPENAI_MODEL = process.env.PROPERTY_INGEST_VISION_MODEL || process.env.PROPERTY_INGEST_OCR_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
 const EMPTY_FIELDS = {
   title_ja: null,
@@ -25,6 +25,10 @@ const EMPTY_FIELDS = {
   source_agency: null,
   remarks: null
 };
+
+function buildDataUrl(buffer, mimeType) {
+  return `data:${mimeType};base64,${buffer.toString('base64')}`;
+}
 
 function normalizeOptionalNumber(value, integerOnly = false) {
   if (value == null || value === '') return null;
@@ -55,7 +59,7 @@ function normalizeFields(parsed) {
   };
 }
 
-async function callOpenAiTranslator({ rawTextJa, blocks, processingStrategy }) {
+async function callOpenAiVision({ buffer, mimeType, fileName, rawTextJa, blocks, processingStrategy }) {
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -70,24 +74,35 @@ async function callOpenAiTranslator({ rawTextJa, blocks, processingStrategy }) {
         {
           role: 'system',
           content: [
-            'You convert Japanese real estate OCR text into Traditional Chinese property fields.',
+            'You extract Japanese property sheet fields and provide Traditional Chinese output.',
             'Return JSON only.',
-            'Do not invent values.',
-            'Unknown values must be null.',
+            'Do not invent values. Unknown values must be null.',
             processingStrategy === 'hybrid_assist'
-              ? 'OCR text may be incomplete; preserve OCR-grounded values and avoid guessing.'
-              : 'Use OCR text as the only source of truth.',
+              ? 'OCR text is provided as a noisy hint. Use the image as the primary source when OCR conflicts.'
+              : 'Use the image as the only source of truth.',
             'Schema keys must be exactly:',
             Object.keys(EMPTY_FIELDS).join(', ')
           ].join('\n')
         },
         {
           role: 'user',
-          content: JSON.stringify({
-            ocr_text_ja: rawTextJa,
-            ocr_blocks: Array.isArray(blocks) ? blocks.slice(0, 300) : [],
-            processing_strategy: processingStrategy
-          }, null, 2)
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                file_name: fileName || 'upload',
+                processing_strategy: processingStrategy,
+                ocr_text_ja_hint: rawTextJa ?? null,
+                ocr_blocks_hint: Array.isArray(blocks) ? blocks.slice(0, 300) : []
+              }, null, 2)
+            },
+            {
+              type: 'image_url',
+              image_url: {
+                url: buildDataUrl(buffer, mimeType)
+              }
+            }
+          ]
         }
       ]
     })
@@ -95,27 +110,27 @@ async function callOpenAiTranslator({ rawTextJa, blocks, processingStrategy }) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`OpenAI translation error (${response.status}): ${errorText}`);
+    throw new Error(`OpenAI vision property error (${response.status}): ${errorText}`);
   }
 
   const rawJson = await response.json();
   const content = rawJson?.choices?.[0]?.message?.content;
   const parsed = safeParseJSON(content);
   if (!parsed) {
-    throw new Error('OpenAI translator returned non-JSON output.');
+    throw new Error('OpenAI vision property provider returned non-JSON output.');
   }
 
   const translatedFields = normalizeFields(parsed);
   const tokenUsage = extractTokenUsage(rawJson);
   const estimatedCostUsd = estimateCostUsd({
     tokenUsage,
-    inputCostEnvKey: 'PROPERTY_INGEST_TRANSLATOR_INPUT_COST_PER_1M',
-    outputCostEnvKey: 'PROPERTY_INGEST_TRANSLATOR_OUTPUT_COST_PER_1M'
+    inputCostEnvKey: 'PROPERTY_INGEST_VISION_INPUT_COST_PER_1M',
+    outputCostEnvKey: 'PROPERTY_INGEST_VISION_OUTPUT_COST_PER_1M'
   });
 
   return {
     status: 'done',
-    provider: 'openai_property_translator',
+    provider: 'openai_property_vision',
     model: OPENAI_MODEL,
     processingStrategy,
     translatedFields,
@@ -129,9 +144,8 @@ async function callOpenAiTranslator({ rawTextJa, blocks, processingStrategy }) {
   };
 }
 
-export async function translatePropertyFields({ rawTextJa, blocks, processingStrategy = 'ocr_then_ai' }) {
-  const text = normalizeOptionalString(rawTextJa, 60000);
-  if (!text) {
+export async function extractAndTranslate({ buffer, mimeType, fileName, rawTextJa = null, blocks = [], processingStrategy = 'vision_only_fallback' }) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     return {
       status: 'failed',
       provider: null,
@@ -143,12 +157,46 @@ export async function translatePropertyFields({ rawTextJa, blocks, processingStr
       tokenUsage: null,
       estimatedCostUsd: null,
       rawJson: null,
-      errorCode: 'TRANSLATION_INPUT_MISSING',
-      errorMessage: 'OCR text is required before translation can start.'
+      errorCode: 'VISION_EMPTY_FILE',
+      errorMessage: 'No file bytes were provided for vision fallback.'
     };
   }
 
-  const canUseOpenAi = Boolean(OPENAI_API_KEY) && (TRANSLATOR_PROVIDER === '' || TRANSLATOR_PROVIDER === 'openai_property_translator');
+  if (mimeType === 'application/pdf') {
+    return {
+      status: 'failed',
+      provider: null,
+      model: null,
+      processingStrategy,
+      translatedFields: null,
+      keyFieldCoverage: null,
+      confidence: null,
+      tokenUsage: null,
+      estimatedCostUsd: null,
+      rawJson: null,
+      errorCode: 'VISION_PDF_NOT_SUPPORTED',
+      errorMessage: 'The current vision provider only supports image uploads; PDF support needs a dedicated document provider.'
+    };
+  }
+
+  if (!mimeType?.startsWith('image/')) {
+    return {
+      status: 'failed',
+      provider: null,
+      model: null,
+      processingStrategy,
+      translatedFields: null,
+      keyFieldCoverage: null,
+      confidence: null,
+      tokenUsage: null,
+      estimatedCostUsd: null,
+      rawJson: null,
+      errorCode: 'VISION_UNSUPPORTED_FILE_TYPE',
+      errorMessage: 'Only image uploads are supported for vision fallback.'
+    };
+  }
+
+  const canUseOpenAi = Boolean(OPENAI_API_KEY) && (VISION_PROVIDER === '' || VISION_PROVIDER === 'openai_property_vision');
   if (!canUseOpenAi) {
     return {
       status: 'unconfigured',
@@ -161,17 +209,17 @@ export async function translatePropertyFields({ rawTextJa, blocks, processingStr
       tokenUsage: null,
       estimatedCostUsd: null,
       rawJson: null,
-      errorCode: 'TRANSLATOR_PROVIDER_NOT_CONFIGURED',
-      errorMessage: 'No translation provider is configured for property ingest.'
+      errorCode: 'VISION_PROVIDER_NOT_CONFIGURED',
+      errorMessage: 'No vision property provider is configured for property ingest.'
     };
   }
 
   try {
-    return await callOpenAiTranslator({ rawTextJa: text, blocks, processingStrategy });
+    return await callOpenAiVision({ buffer, mimeType, fileName, rawTextJa, blocks, processingStrategy });
   } catch (error) {
     return {
       status: 'failed',
-      provider: 'openai_property_translator',
+      provider: 'openai_property_vision',
       model: OPENAI_MODEL,
       processingStrategy,
       translatedFields: null,
@@ -180,8 +228,8 @@ export async function translatePropertyFields({ rawTextJa, blocks, processingStr
       tokenUsage: null,
       estimatedCostUsd: null,
       rawJson: null,
-      errorCode: 'TRANSLATOR_PROVIDER_ERROR',
-      errorMessage: error instanceof Error ? error.message : 'Unknown translation error.'
+      errorCode: 'VISION_PROVIDER_ERROR',
+      errorMessage: error instanceof Error ? error.message : 'Unknown vision property error.'
     };
   }
 }

@@ -1,50 +1,17 @@
+import {
+  buildTextCoverage,
+  estimateCostUsd,
+  extractTokenUsage,
+  normalizeBlocks,
+  normalizeConfidence,
+  normalizeOptionalString,
+  recommendNextStep,
+  safeParseJSON
+} from './strategyUtils.js';
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OCR_PROVIDER = String(process.env.OCR_PROVIDER || process.env.PROPERTY_INTAKE_OCR_PROVIDER || '').trim().toLowerCase();
 const OPENAI_MODEL = process.env.PROPERTY_INGEST_OCR_MODEL || process.env.PROPERTY_INTAKE_OCR_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
-
-function safeParseJSON(content) {
-  if (!content || typeof content !== 'string') return null;
-
-  try {
-    return JSON.parse(content);
-  } catch {
-    const match = content.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]);
-    } catch {
-      return null;
-    }
-  }
-}
-
-function normalizeOptionalString(value, maxLength = 30000) {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
-}
-
-function normalizeConfidence(value) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
-  if (value < 0 || value > 1) return null;
-  return value;
-}
-
-function normalizeBlocks(value) {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((item, index) => {
-      const text = normalizeOptionalString(item?.text, 5000);
-      if (!text) return null;
-      return {
-        page_number: Number.isInteger(item?.page_number) ? item.page_number : null,
-        block_index: Number.isInteger(item?.block_index) ? item.block_index : index,
-        text
-      };
-    })
-    .filter(Boolean);
-}
 
 function buildDataUrl(buffer, mimeType) {
   return `data:${mimeType};base64,${buffer.toString('base64')}`;
@@ -112,13 +79,29 @@ async function callOpenAiImageOcr({ buffer, mimeType, fileName }) {
     throw new Error('OpenAI OCR returned non-JSON output.');
   }
 
+  const rawText = normalizeOptionalString(parsed.raw_text_ja, 60000);
+  const blocks = normalizeBlocks(parsed.blocks);
+  const confidence = normalizeConfidence(parsed.confidence);
+  const keyFieldCoverage = buildTextCoverage(rawText);
+  const tokenUsage = extractTokenUsage(rawJson);
+  const estimatedCostUsd = estimateCostUsd({
+    tokenUsage,
+    inputCostEnvKey: 'PROPERTY_INGEST_OCR_INPUT_COST_PER_1M',
+    outputCostEnvKey: 'PROPERTY_INGEST_OCR_OUTPUT_COST_PER_1M'
+  });
+
   return {
     status: 'done',
     provider: 'openai_vision',
     model: OPENAI_MODEL,
-    rawText: normalizeOptionalString(parsed.raw_text_ja, 60000),
-    blocks: normalizeBlocks(parsed.blocks),
-    confidence: normalizeConfidence(parsed.confidence),
+    processingStrategy: 'ocr_scan',
+    rawText,
+    blocks,
+    confidence,
+    keyFieldCoverage,
+    recommendedNextStep: recommendNextStep({ confidence, keyFieldCoverage, rawText }),
+    tokenUsage,
+    estimatedCostUsd,
     rawJson,
     errorCode: null,
     errorMessage: null
@@ -131,9 +114,14 @@ export async function extractText({ buffer, mimeType, fileName }) {
       status: 'failed',
       provider: null,
       model: null,
+      processingStrategy: 'ocr_scan',
       rawText: null,
       blocks: [],
       confidence: null,
+      keyFieldCoverage: buildTextCoverage(null),
+      recommendedNextStep: 'vision_only_fallback',
+      tokenUsage: null,
+      estimatedCostUsd: null,
       rawJson: null,
       errorCode: 'OCR_EMPTY_FILE',
       errorMessage: 'No file bytes were provided for OCR.'
@@ -147,9 +135,14 @@ export async function extractText({ buffer, mimeType, fileName }) {
       status: canUseOpenAi ? 'failed' : 'unconfigured',
       provider: canUseOpenAi ? 'openai_vision' : null,
       model: canUseOpenAi ? OPENAI_MODEL : null,
+      processingStrategy: 'ocr_scan',
       rawText: null,
       blocks: [],
       confidence: null,
+      keyFieldCoverage: buildTextCoverage(null),
+      recommendedNextStep: null,
+      tokenUsage: null,
+      estimatedCostUsd: null,
       rawJson: null,
       errorCode: canUseOpenAi ? 'OCR_PDF_NOT_SUPPORTED' : 'OCR_PROVIDER_NOT_CONFIGURED',
       errorMessage: canUseOpenAi
@@ -163,9 +156,14 @@ export async function extractText({ buffer, mimeType, fileName }) {
       status: 'failed',
       provider: null,
       model: null,
+      processingStrategy: 'ocr_scan',
       rawText: null,
       blocks: [],
       confidence: null,
+      keyFieldCoverage: buildTextCoverage(null),
+      recommendedNextStep: null,
+      tokenUsage: null,
+      estimatedCostUsd: null,
       rawJson: null,
       errorCode: 'OCR_UNSUPPORTED_FILE_TYPE',
       errorMessage: 'Only image or PDF uploads are supported for OCR.'
@@ -177,9 +175,14 @@ export async function extractText({ buffer, mimeType, fileName }) {
       status: 'unconfigured',
       provider: null,
       model: null,
+      processingStrategy: 'ocr_scan',
       rawText: null,
       blocks: [],
       confidence: null,
+      keyFieldCoverage: buildTextCoverage(null),
+      recommendedNextStep: null,
+      tokenUsage: null,
+      estimatedCostUsd: null,
       rawJson: null,
       errorCode: 'OCR_PROVIDER_NOT_CONFIGURED',
       errorMessage: 'No OCR provider is configured for property ingest.'
@@ -192,6 +195,7 @@ export async function extractText({ buffer, mimeType, fileName }) {
       return {
         ...result,
         status: 'failed',
+        recommendedNextStep: 'vision_only_fallback',
         errorCode: 'OCR_EMPTY_RESULT',
         errorMessage: 'OCR completed but did not return usable text.'
       };
@@ -202,9 +206,14 @@ export async function extractText({ buffer, mimeType, fileName }) {
       status: 'failed',
       provider: 'openai_vision',
       model: OPENAI_MODEL,
+      processingStrategy: 'ocr_scan',
       rawText: null,
       blocks: [],
       confidence: null,
+      keyFieldCoverage: buildTextCoverage(null),
+      recommendedNextStep: null,
+      tokenUsage: null,
+      estimatedCostUsd: null,
       rawJson: null,
       errorCode: 'OCR_PROVIDER_ERROR',
       errorMessage: error instanceof Error ? error.message : 'Unknown OCR error.'

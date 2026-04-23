@@ -13,7 +13,8 @@ import {
   validateApproveInput,
   validateCreateInput,
   validateReviewInput,
-  validateRunInput
+  validateRunInput,
+  validateTranslateInput
 } from '../services/propertyIngestJobs.js';
 
 const router = Router();
@@ -97,7 +98,7 @@ router.post('/:id/run-ocr', async (req, res) => {
 });
 
 router.post('/:id/run-translate', async (req, res) => {
-  const validation = validateRunInput(req.body || {});
+  const validation = validateTranslateInput(req.body || {});
   if (!validation.ok) {
     return respondError(res, validation.status, validation.code, validation.message, validation.details ?? null);
   }
@@ -106,10 +107,7 @@ router.post('/:id/run-translate', async (req, res) => {
     supabase: req.supabase,
     auth: req.auth,
     id: req.params.id,
-    body: {
-      ...validation.input,
-      requested_store_id: req.body?.store_id ?? null
-    }
+    body: validation.input
   });
 
   if (!result.ok) {

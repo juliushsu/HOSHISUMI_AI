@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { createServiceSupabase } from '../lib/supabase.js';
 import { extractText } from './propertyIngestProviders/ocrProvider.js';
 import { translatePropertyFields } from './propertyIngestProviders/translatorProvider.js';
+import { extractAndTranslate } from './propertyIngestProviders/visionPropertyProvider.js';
+import { PROCESSING_STRATEGY_ENUM, normalizeOptionalString, RECOMMENDED_NEXT_STEP_ENUM } from './propertyIngestProviders/strategyUtils.js';
 
 const OWNER_SCOPE_ROLES = new Set(['owner', 'super_admin']);
 const STORE_SCOPE_ROLES = new Set(['manager', 'store_manager', 'store_editor']);
@@ -11,7 +13,9 @@ const JOB_STATUS_ENUM = new Set([
   'uploaded',
   'ocr_processing',
   'ocr_done',
+  'ocr_low_confidence',
   'translating',
+  'vision_fallback_processing',
   'translated',
   'pending_review',
   'approved',
@@ -48,6 +52,14 @@ const JOB_SELECT = [
   'status',
   'ocr_status',
   'translation_status',
+  'processing_strategy',
+  'recommended_next_step',
+  'key_field_coverage_json',
+  'current_ocr_confidence',
+  'token_input_count',
+  'token_output_count',
+  'token_total_count',
+  'estimated_cost_usd',
   'primary_file_name',
   'primary_file_mime_type',
   'primary_file_size_bytes',
@@ -72,20 +84,20 @@ function isPlainObject(value) {
   return value != null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function normalizeOptionalText(value, maxLength = 5000) {
-  if (value == null) return null;
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
-}
-
 function normalizeUuid(value) {
   const normalized = normalizeOptionalText(value, 100);
   if (!normalized) return normalized;
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)
     ? normalized
     : undefined;
+}
+
+function normalizeOptionalText(value, maxLength = 5000) {
+  if (value == null) return null;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
 }
 
 function parseOptionalJSONObject(value) {
@@ -152,21 +164,14 @@ function assertIngestAccessAllowed({ auth, requiresWrite = false }) {
     };
   }
 
-  if (requiresWrite && !isFeatureEnabled()) {
+  if (!isFeatureEnabled()) {
     return {
       ok: false,
       status: 403,
       code: 'PROPERTY_INGEST_DISABLED',
-      message: 'Property ingest writes are currently disabled by environment setting.'
-    };
-  }
-
-  if (!requiresWrite && !isFeatureEnabled()) {
-    return {
-      ok: false,
-      status: 403,
-      code: 'PROPERTY_INGEST_DISABLED',
-      message: 'Property ingest is currently disabled by environment setting.'
+      message: requiresWrite
+        ? 'Property ingest writes are currently disabled by environment setting.'
+        : 'Property ingest is currently disabled by environment setting.'
     };
   }
 
@@ -200,11 +205,9 @@ function buildRawFilePath({ organizationId, storeId, jobId, fileName }) {
 function mergeFields(base, patch) {
   const next = isPlainObject(base) ? { ...base } : {};
   if (!isPlainObject(patch)) return next;
-
   for (const [key, value] of Object.entries(patch)) {
     next[key] = value;
   }
-
   return next;
 }
 
@@ -218,13 +221,26 @@ function buildFieldChanges(before, after) {
     const prevValue = previous[key] ?? null;
     const nextValue = next[key] ?? null;
     if (JSON.stringify(prevValue) === JSON.stringify(nextValue)) continue;
-    changes[key] = {
-      before: prevValue,
-      after: nextValue
-    };
+    changes[key] = { before: prevValue, after: nextValue };
   }
 
   return changes;
+}
+
+function sumNullableCost(left, right) {
+  const leftValue = typeof left === 'number' && Number.isFinite(left) ? left : null;
+  const rightValue = typeof right === 'number' && Number.isFinite(right) ? right : null;
+  if (leftValue == null && rightValue == null) return null;
+  return Number(((leftValue ?? 0) + (rightValue ?? 0)).toFixed(6));
+}
+
+function buildUsageTotals(job, tokenUsage, estimatedCostUsd) {
+  return {
+    token_input_count: (job.token_input_count ?? 0) + (tokenUsage?.input_tokens ?? 0),
+    token_output_count: (job.token_output_count ?? 0) + (tokenUsage?.output_tokens ?? 0),
+    token_total_count: (job.token_total_count ?? 0) + (tokenUsage?.total_tokens ?? 0),
+    estimated_cost_usd: sumNullableCost(job.estimated_cost_usd, estimatedCostUsd)
+  };
 }
 
 function buildPreview(row) {
@@ -243,12 +259,102 @@ function buildPreview(row) {
   };
 }
 
+function toFileDto(row) {
+  return {
+    id: row.id,
+    storage_bucket: row.storage_bucket,
+    storage_path: row.storage_path,
+    original_file_name: row.original_file_name,
+    mime_type: row.mime_type,
+    size_bytes: row.size_bytes ?? null,
+    file_kind: row.file_kind,
+    created_at: row.created_at
+  };
+}
+
+function toOcrResultDto(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    provider: row.provider ?? null,
+    provider_model: row.provider_model ?? null,
+    status: row.status,
+    processing_strategy: row.processing_strategy ?? null,
+    raw_text_ja: row.raw_text_ja ?? null,
+    blocks_json: row.blocks_json ?? [],
+    confidence: row.confidence ?? null,
+    key_field_coverage: row.key_field_coverage_json ?? null,
+    recommended_next_step: row.recommended_next_step ?? null,
+    token_usage: {
+      input_tokens: row.token_input_count ?? null,
+      output_tokens: row.token_output_count ?? null,
+      total_tokens: row.token_total_count ?? null
+    },
+    estimated_cost_usd: row.estimated_cost_usd ?? null,
+    raw_json: row.raw_json ?? null,
+    error_code: row.error_code ?? null,
+    error_message: row.error_message ?? null,
+    created_at: row.created_at
+  };
+}
+
+function toTranslationResultDto(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    provider: row.provider ?? null,
+    provider_model: row.provider_model ?? null,
+    status: row.status,
+    processing_strategy: row.processing_strategy ?? null,
+    source_language: row.source_language,
+    target_language: row.target_language,
+    translated_fields_json: row.translated_fields_json ?? null,
+    key_field_coverage: row.key_field_coverage_json ?? null,
+    confidence: row.confidence ?? null,
+    token_usage: {
+      input_tokens: row.token_input_count ?? null,
+      output_tokens: row.token_output_count ?? null,
+      total_tokens: row.token_total_count ?? null
+    },
+    estimated_cost_usd: row.estimated_cost_usd ?? null,
+    raw_json: row.raw_json ?? null,
+    error_code: row.error_code ?? null,
+    error_message: row.error_message ?? null,
+    created_at: row.created_at
+  };
+}
+
+function toReviewDecisionDto(row) {
+  return {
+    id: row.id,
+    decision: row.decision,
+    status_before: row.status_before,
+    status_after: row.status_after,
+    translated_fields_before_json: row.translated_fields_before_json ?? null,
+    reviewed_fields_json: row.reviewed_fields_json ?? null,
+    field_changes_json: row.field_changes_json ?? null,
+    notes: row.notes ?? null,
+    created_by: row.created_by ?? null,
+    created_at: row.created_at
+  };
+}
+
 function toJobListDto(row) {
   return {
     id: row.id,
     status: row.status,
     ocr_status: row.ocr_status,
     translation_status: row.translation_status,
+    processing_strategy: row.processing_strategy ?? null,
+    recommended_next_step: row.recommended_next_step ?? null,
+    key_field_coverage: row.key_field_coverage_json ?? null,
+    current_ocr_confidence: row.current_ocr_confidence ?? null,
+    token_usage: {
+      input_tokens: row.token_input_count ?? null,
+      output_tokens: row.token_output_count ?? null,
+      total_tokens: row.token_total_count ?? null
+    },
+    estimated_cost_usd: row.estimated_cost_usd ?? null,
     organization_id: row.organization_id,
     company_id: row.company_id ?? null,
     store_id: row.store_id ?? null,
@@ -269,27 +375,29 @@ function toJobDetailDto(row, extras) {
       company_id: row.company_id ?? null,
       store_id: row.store_id ?? null,
       store: row.store
-        ? {
-            id: row.store.id,
-            name: row.store.name,
-            slug: row.store.slug ?? null
-          }
+        ? { id: row.store.id, name: row.store.name, slug: row.store.slug ?? null }
         : null,
       environment_type: row.environment_type,
       source_type: row.source_type,
       source_channel: row.source_channel ?? null,
       source_partner_id: row.source_partner_id ?? null,
       source_partner: row.partner
-        ? {
-            id: row.partner.id,
-            display_name: row.partner.display_name ?? null,
-            status: row.partner.status ?? null
-          }
+        ? { id: row.partner.id, display_name: row.partner.display_name ?? null, status: row.partner.status ?? null }
         : null,
       metadata: row.metadata_json ?? null,
       status: row.status,
       ocr_status: row.ocr_status,
       translation_status: row.translation_status,
+      processing_strategy: row.processing_strategy ?? null,
+      recommended_next_step: row.recommended_next_step ?? null,
+      key_field_coverage: row.key_field_coverage_json ?? null,
+      current_ocr_confidence: row.current_ocr_confidence ?? null,
+      token_usage: {
+        input_tokens: row.token_input_count ?? null,
+        output_tokens: row.token_output_count ?? null,
+        total_tokens: row.token_total_count ?? null
+      },
+      estimated_cost_usd: row.estimated_cost_usd ?? null,
       failure_code: row.failure_code ?? null,
       failure_message: row.failure_message ?? null,
       current_ocr_text_ja: row.current_ocr_text_ja ?? null,
@@ -304,10 +412,10 @@ function toJobDetailDto(row, extras) {
       reviewed_at: row.reviewed_at ?? null,
       approved_at: row.approved_at ?? null
     },
-    files: extras.files,
-    ocr_result: extras.latestOcrResult,
-    translation_result: extras.latestTranslationResult,
-    review_history: extras.reviewHistory,
+    files: extras.files.map(toFileDto),
+    ocr_result: toOcrResultDto(extras.latestOcrResult),
+    translation_result: toTranslationResultDto(extras.latestTranslationResult),
+    review_history: extras.reviewHistory.map(toReviewDecisionDto),
     file_access: extras.fileAccess,
     preview: buildPreview(row)
   };
@@ -651,11 +759,7 @@ async function fetchReviewHistory(supabase, jobId) {
 
 async function buildFileAccess(fileRow) {
   if (!fileRow) {
-    return {
-      strategy: 'none',
-      signed_url: null,
-      expires_in_seconds: null
-    };
+    return { strategy: 'none', signed_url: null, expires_in_seconds: null };
   }
 
   try {
@@ -665,11 +769,7 @@ async function buildFileAccess(fileRow) {
       .createSignedUrl(fileRow.storage_path, SIGNED_URL_TTL_SECONDS);
 
     if (error || !data?.signedUrl) {
-      return {
-        strategy: 'storage_path_only',
-        signed_url: null,
-        expires_in_seconds: null
-      };
+      return { strategy: 'storage_path_only', signed_url: null, expires_in_seconds: null };
     }
 
     return {
@@ -678,11 +778,7 @@ async function buildFileAccess(fileRow) {
       expires_in_seconds: SIGNED_URL_TTL_SECONDS
     };
   } catch {
-    return {
-      strategy: 'storage_path_only',
-      signed_url: null,
-      expires_in_seconds: null
-    };
+    return { strategy: 'storage_path_only', signed_url: null, expires_in_seconds: null };
   }
 }
 
@@ -746,7 +842,7 @@ async function insertReviewDecision(supabase, payload) {
   return { ok: true, row: data };
 }
 
-async function downloadPrimaryFile(jobId, files) {
+async function downloadPrimaryFile(files) {
   const primaryFile = (files || []).find((item) => item.file_kind === 'raw_source') || files?.[0] || null;
   if (!primaryFile) {
     return {
@@ -774,11 +870,7 @@ async function downloadPrimaryFile(jobId, files) {
     }
 
     const buffer = Buffer.from(await data.arrayBuffer());
-    return {
-      ok: true,
-      file: primaryFile,
-      buffer
-    };
+    return { ok: true, file: primaryFile, buffer };
   } catch (error) {
     return {
       ok: false,
@@ -857,9 +949,12 @@ function deriveCanonicalPropertyPayload(job) {
         company_id: job.company_id ?? null,
         source_type: job.source_type,
         source_channel: job.source_channel ?? null,
+        processing_strategy: job.processing_strategy ?? null,
+        recommended_next_step: job.recommended_next_step ?? null,
+        key_field_coverage_json: job.key_field_coverage_json ?? null,
         translated_fields: job.current_translated_fields_json ?? null,
         reviewed_fields: job.current_reviewed_fields_json ?? null,
-        mapping_version: 'property_ingest_v1'
+        mapping_version: 'property_ingest_v1_strategy'
       },
       service_types: ['rental'],
       is_rental_enabled: true,
@@ -920,12 +1015,7 @@ export function validateCreateInput(body, file) {
   }
 
   if (!file) {
-    return {
-      ok: false,
-      status: 400,
-      code: 'FILE_REQUIRED',
-      message: 'file is required.'
-    };
+    return { ok: false, status: 400, code: 'FILE_REQUIRED', message: 'file is required.' };
   }
 
   if (!PROPERTY_INGEST_ALLOWED_MIME_TYPES.has(file.mimetype)) {
@@ -960,33 +1050,53 @@ export function validateCreateInput(body, file) {
 
 export function validateRunInput(body) {
   if (body == null || body === '') {
-    return { ok: true, input: { force_rerun: false } };
+    return { ok: true, input: { force_rerun: false, requested_store_id: null } };
   }
   if (!isPlainObject(body)) {
+    return { ok: false, status: 400, code: 'INVALID_BODY', message: 'Request body must be a JSON object.' };
+  }
+
+  const requestedStoreId = body.store_id === undefined ? null : normalizeUuid(body.store_id);
+  if (body.store_id !== undefined && body.store_id !== '' && requestedStoreId === undefined) {
     return {
       ok: false,
       status: 400,
-      code: 'INVALID_BODY',
-      message: 'Request body must be a JSON object.'
+      code: 'INVALID_STORE_ID',
+      message: 'store_id must be a UUID string when provided.'
+    };
+  }
+
+  return { ok: true, input: { force_rerun: body.force_rerun === true, requested_store_id: requestedStoreId ?? null } };
+}
+
+export function validateTranslateInput(body) {
+  const base = validateRunInput(body);
+  if (!base.ok) return base;
+
+  const strategy = body?.strategy === undefined || body?.strategy === null || body?.strategy === ''
+    ? null
+    : String(body.strategy).trim();
+  if (strategy && !PROCESSING_STRATEGY_ENUM.has(strategy)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_PROCESSING_STRATEGY',
+      message: 'strategy must be ocr_then_ai/hybrid_assist/vision_only_fallback.'
     };
   }
 
   return {
     ok: true,
     input: {
-      force_rerun: body.force_rerun === true
+      ...base.input,
+      strategy
     }
   };
 }
 
 export function validateReviewInput(body) {
   if (!isPlainObject(body)) {
-    return {
-      ok: false,
-      status: 400,
-      code: 'INVALID_BODY',
-      message: 'Request body must be a JSON object.'
-    };
+    return { ok: false, status: 400, code: 'INVALID_BODY', message: 'Request body must be a JSON object.' };
   }
 
   const decision = String(body.decision || 'reviewed');
@@ -1019,13 +1129,23 @@ export function validateReviewInput(body) {
     };
   }
 
+  const requestedStoreId = body.store_id === undefined ? null : normalizeUuid(body.store_id);
+  if (body.store_id !== undefined && body.store_id !== '' && requestedStoreId === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_STORE_ID',
+      message: 'store_id must be a UUID string when provided.'
+    };
+  }
+
   return {
     ok: true,
     input: {
       decision,
       reviewed_fields: reviewedFields,
       notes: notes ?? null,
-      requested_store_id: normalizeUuid(body.store_id) ?? null
+      requested_store_id: requestedStoreId ?? null
     }
   };
 }
@@ -1034,14 +1154,8 @@ export function validateApproveInput(body) {
   if (body == null || body === '') {
     return { ok: true, input: { notes: null, requested_store_id: null } };
   }
-
   if (!isPlainObject(body)) {
-    return {
-      ok: false,
-      status: 400,
-      code: 'INVALID_BODY',
-      message: 'Request body must be a JSON object.'
-    };
+    return { ok: false, status: 400, code: 'INVALID_BODY', message: 'Request body must be a JSON object.' };
   }
 
   const notes = body.notes === undefined ? null : normalizeOptionalText(body.notes, 5000);
@@ -1064,13 +1178,7 @@ export function validateApproveInput(body) {
     };
   }
 
-  return {
-    ok: true,
-    input: {
-      notes: notes ?? null,
-      requested_store_id: requestedStoreId ?? null
-    }
-  };
+  return { ok: true, input: { notes: notes ?? null, requested_store_id: requestedStoreId ?? null } };
 }
 
 export async function createPropertyIngestJob({ supabase, auth, body, file }) {
@@ -1085,38 +1193,31 @@ export async function createPropertyIngestJob({ supabase, auth, body, file }) {
 
   const serviceSupabase = createServiceSupabase();
   const jobId = randomUUID();
-  const filePath = buildRawFilePath({
-    organizationId: auth.organizationId,
-    storeId: scope.store_id,
-    jobId,
-    fileName: file.originalname
-  });
+  const filePath = buildRawFilePath({ organizationId: auth.organizationId, storeId: scope.store_id, jobId, fileName: file.originalname });
 
   const upload = await uploadRawFile({ serviceSupabase, filePath, file });
   if (!upload.ok) return upload;
 
-  const jobInsert = {
-    id: jobId,
-    organization_id: auth.organizationId,
-    company_id: null,
-    store_id: scope.store_id,
-    environment_type: access.environmentType,
-    created_by: auth.agentId,
-    source_type: body.source_type,
-    source_channel: body.source_channel,
-    source_partner_id: body.source_partner_id,
-    metadata_json: body.metadata,
-    status: 'uploaded',
-    ocr_status: 'pending',
-    translation_status: 'pending',
-    primary_file_name: file.originalname,
-    primary_file_mime_type: file.mimetype,
-    primary_file_size_bytes: file.size
-  };
-
   const { data: jobRow, error: jobError } = await supabase
     .from('property_ingest_jobs')
-    .insert(jobInsert)
+    .insert({
+      id: jobId,
+      organization_id: auth.organizationId,
+      company_id: null,
+      store_id: scope.store_id,
+      environment_type: access.environmentType,
+      created_by: auth.agentId,
+      source_type: body.source_type,
+      source_channel: body.source_channel,
+      source_partner_id: body.source_partner_id,
+      metadata_json: body.metadata,
+      status: 'uploaded',
+      ocr_status: 'pending',
+      translation_status: 'pending',
+      primary_file_name: file.originalname,
+      primary_file_mime_type: file.mimetype,
+      primary_file_size_bytes: file.size
+    })
     .select(JOB_SELECT)
     .maybeSingle();
 
@@ -1171,7 +1272,7 @@ export async function createPropertyIngestJob({ supabase, auth, body, file }) {
         reviewHistory: [],
         fileAccess: await buildFileAccess(fileRow)
       }).job,
-      file: fileRow
+      file: toFileDto(fileRow)
     }
   };
 }
@@ -1207,6 +1308,19 @@ export async function listPropertyIngestJobs({ supabase, auth, query }) {
       };
     }
     request = request.eq('status', status);
+  }
+
+  if (query.processing_strategy) {
+    const processingStrategy = String(query.processing_strategy);
+    if (!PROCESSING_STRATEGY_ENUM.has(processingStrategy)) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'INVALID_PROCESSING_STRATEGY',
+        message: 'processing_strategy must be ocr_then_ai/hybrid_assist/vision_only_fallback.'
+      };
+    }
+    request = request.eq('processing_strategy', processingStrategy);
   }
 
   const search = normalizeOptionalText(query.search, 200);
@@ -1278,12 +1392,17 @@ export async function runPropertyIngestOcr({ supabase, auth, id, body }) {
   if (!job.ok) return job;
 
   if (!body.force_rerun && job.row.ocr_status === 'done') {
+    const latest = await fetchLatestOcrResult(supabase, id);
+    if (!latest.ok) return latest;
     return {
       ok: true,
       data: {
         job_id: job.row.id,
         status: job.row.status,
-        ocr_result: await fetchLatestOcrResult(supabase, job.row.id).then((result) => result.ok ? result.row : null)
+        ocr_confidence: job.row.current_ocr_confidence ?? null,
+        key_field_coverage: job.row.key_field_coverage_json ?? null,
+        recommended_next_step: job.row.recommended_next_step ?? null,
+        ocr_result: toOcrResultDto(latest.row)
       }
     };
   }
@@ -1291,7 +1410,7 @@ export async function runPropertyIngestOcr({ supabase, auth, id, body }) {
   const filesResult = await fetchFilesForJob(supabase, id);
   if (!filesResult.ok) return filesResult;
 
-  const fileDownload = await downloadPrimaryFile(id, filesResult.rows);
+  const fileDownload = await downloadPrimaryFile(filesResult.rows);
   if (!fileDownload.ok) {
     await updateJobRow(supabase, id, {
       status: 'failed',
@@ -1306,6 +1425,8 @@ export async function runPropertyIngestOcr({ supabase, auth, id, body }) {
     status: 'ocr_processing',
     ocr_status: 'processing',
     translation_status: 'pending',
+    recommended_next_step: null,
+    processing_strategy: null,
     failure_code: null,
     failure_message: null
   });
@@ -1317,33 +1438,46 @@ export async function runPropertyIngestOcr({ supabase, auth, id, body }) {
     fileName: fileDownload.file.original_file_name
   });
 
-  const ocrResultInsert = await insertOcrResult(supabase, {
+  const ocrInsert = await insertOcrResult(supabase, {
     job_id: id,
     organization_id: auth.organizationId,
     company_id: null,
     provider: ocr.provider,
     provider_model: ocr.model,
     status: ocr.status,
+    processing_strategy: ocr.processingStrategy,
     raw_text_ja: ocr.rawText,
     blocks_json: ocr.blocks,
     raw_json: ocr.rawJson,
     confidence: ocr.confidence,
+    key_field_coverage_json: ocr.keyFieldCoverage,
+    recommended_next_step: ocr.recommendedNextStep,
+    token_input_count: ocr.tokenUsage?.input_tokens ?? null,
+    token_output_count: ocr.tokenUsage?.output_tokens ?? null,
+    token_total_count: ocr.tokenUsage?.total_tokens ?? null,
+    estimated_cost_usd: ocr.estimatedCostUsd,
     error_code: ocr.errorCode,
     error_message: ocr.errorMessage,
     created_by: auth.agentId
   });
-  if (!ocrResultInsert.ok) return ocrResultInsert;
+  if (!ocrInsert.ok) return ocrInsert;
 
-  const nextStatus = ocr.status === 'done' ? 'ocr_done' : 'failed';
-  const nextOcrStatus = ocr.status === 'done' ? 'done' : ocr.status;
+  const usageTotals = buildUsageTotals(job.row, ocr.tokenUsage, ocr.estimatedCostUsd);
+  const jobStatus = ocr.status === 'done'
+    ? (ocr.recommendedNextStep === 'ocr_then_ai' ? 'ocr_done' : 'ocr_low_confidence')
+    : 'failed';
   const updatedJob = await updateJobRow(supabase, id, {
-    status: nextStatus,
-    ocr_status: nextOcrStatus,
+    status: jobStatus,
+    ocr_status: ocr.status === 'done' ? 'done' : ocr.status,
     current_ocr_text_ja: ocr.rawText,
     current_ocr_blocks_json: ocr.blocks,
+    current_ocr_confidence: ocr.confidence,
+    key_field_coverage_json: ocr.keyFieldCoverage,
+    recommended_next_step: ocr.recommendedNextStep,
     translation_status: 'pending',
     failure_code: ocr.errorCode,
-    failure_message: ocr.errorMessage
+    failure_message: ocr.errorMessage,
+    ...usageTotals
   });
   if (!updatedJob.ok) return updatedJob;
 
@@ -1352,7 +1486,10 @@ export async function runPropertyIngestOcr({ supabase, auth, id, body }) {
     data: {
       job_id: id,
       status: updatedJob.row.status,
-      ocr_result: ocrResultInsert.row
+      ocr_confidence: ocr.confidence,
+      key_field_coverage: ocr.keyFieldCoverage,
+      recommended_next_step: ocr.recommendedNextStep,
+      ocr_result: toOcrResultDto(ocrInsert.row)
     }
   };
 }
@@ -1364,41 +1501,76 @@ export async function runPropertyIngestTranslate({ supabase, auth, id, body }) {
   const job = await fetchJobInScope({ supabase, auth, id, requestedStoreId: body.requested_store_id ?? null });
   if (!job.ok) return job;
 
-  if (!body.force_rerun && job.row.translation_status === 'done') {
+  const strategy = body.strategy || job.row.recommended_next_step || 'ocr_then_ai';
+  if (!PROCESSING_STRATEGY_ENUM.has(strategy)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_PROCESSING_STRATEGY',
+      message: 'strategy must be ocr_then_ai/hybrid_assist/vision_only_fallback.'
+    };
+  }
+
+  if (!body.force_rerun && job.row.translation_status === 'done' && job.row.processing_strategy === strategy) {
+    const latest = await fetchLatestTranslationResult(supabase, id);
+    if (!latest.ok) return latest;
     return {
       ok: true,
       data: {
         job_id: job.row.id,
         status: job.row.status,
-        translation_result: await fetchLatestTranslationResult(supabase, job.row.id).then((result) => result.ok ? result.row : null)
+        processing_strategy: strategy,
+        translation_result: toTranslationResultDto(latest.row)
       }
     };
   }
 
-  const latestOcr = await fetchLatestOcrResult(supabase, id);
-  if (!latestOcr.ok) return latestOcr;
-
-  if (!job.row.current_ocr_text_ja) {
-    return {
-      ok: false,
-      status: 400,
-      code: 'PROPERTY_INGEST_TRANSLATION_INPUT_MISSING',
-      message: 'Run OCR successfully before translation.'
-    };
-  }
-
+  const statusBeforeCall = strategy === 'vision_only_fallback' ? 'vision_fallback_processing' : 'translating';
   const jobInProgress = await updateJobRow(supabase, id, {
-    status: 'translating',
+    status: statusBeforeCall,
+    processing_strategy: strategy,
     translation_status: 'processing',
     failure_code: null,
     failure_message: null
   });
   if (!jobInProgress.ok) return jobInProgress;
 
-  const translation = await translatePropertyFields({
-    rawTextJa: job.row.current_ocr_text_ja,
-    blocks: Array.isArray(job.row.current_ocr_blocks_json) ? job.row.current_ocr_blocks_json : []
-  });
+  let translation;
+  if (strategy === 'ocr_then_ai') {
+    if (!normalizeOptionalString(job.row.current_ocr_text_ja, 60000)) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'PROPERTY_INGEST_TRANSLATION_INPUT_MISSING',
+        message: 'Run OCR successfully before translation.'
+      };
+    }
+
+    translation = await translatePropertyFields({
+      rawTextJa: job.row.current_ocr_text_ja,
+      blocks: Array.isArray(job.row.current_ocr_blocks_json) ? job.row.current_ocr_blocks_json : [],
+      processingStrategy: 'ocr_then_ai'
+    });
+  } else {
+    const filesResult = await fetchFilesForJob(supabase, id);
+    if (!filesResult.ok) return filesResult;
+    const fileDownload = await downloadPrimaryFile(filesResult.rows);
+    if (!fileDownload.ok) return fileDownload;
+
+    translation = await extractAndTranslate({
+      buffer: fileDownload.buffer,
+      mimeType: fileDownload.file.mime_type,
+      fileName: fileDownload.file.original_file_name,
+      rawTextJa: strategy === 'hybrid_assist' ? job.row.current_ocr_text_ja : null,
+      blocks: strategy === 'hybrid_assist' && Array.isArray(job.row.current_ocr_blocks_json)
+        ? job.row.current_ocr_blocks_json
+        : [],
+      processingStrategy: strategy
+    });
+  }
+
+  const latestOcr = await fetchLatestOcrResult(supabase, id);
+  if (!latestOcr.ok) return latestOcr;
 
   const translationInsert = await insertTranslationResult(supabase, {
     job_id: id,
@@ -1408,25 +1580,32 @@ export async function runPropertyIngestTranslate({ supabase, auth, id, body }) {
     provider: translation.provider,
     provider_model: translation.model,
     status: translation.status,
+    processing_strategy: translation.processingStrategy,
     source_language: 'ja',
     target_language: 'zh-TW',
     translated_fields_json: translation.translatedFields,
+    key_field_coverage_json: translation.keyFieldCoverage,
     raw_json: translation.rawJson,
     confidence: translation.confidence,
+    token_input_count: translation.tokenUsage?.input_tokens ?? null,
+    token_output_count: translation.tokenUsage?.output_tokens ?? null,
+    token_total_count: translation.tokenUsage?.total_tokens ?? null,
+    estimated_cost_usd: translation.estimatedCostUsd,
     error_code: translation.errorCode,
     error_message: translation.errorMessage,
     created_by: auth.agentId
   });
   if (!translationInsert.ok) return translationInsert;
 
-  const nextStatus = translation.status === 'done' ? 'translated' : 'failed';
-  const nextTranslationStatus = translation.status === 'done' ? 'done' : translation.status;
+  const usageTotals = buildUsageTotals(job.row, translation.tokenUsage, translation.estimatedCostUsd);
   const updatedJob = await updateJobRow(supabase, id, {
-    status: nextStatus,
-    translation_status: nextTranslationStatus,
+    status: translation.status === 'done' ? 'translated' : 'failed',
+    processing_strategy: strategy,
+    translation_status: translation.status === 'done' ? 'done' : translation.status,
     current_translated_fields_json: translation.translatedFields,
     failure_code: translation.errorCode,
-    failure_message: translation.errorMessage
+    failure_message: translation.errorMessage,
+    ...usageTotals
   });
   if (!updatedJob.ok) return updatedJob;
 
@@ -1435,7 +1614,8 @@ export async function runPropertyIngestTranslate({ supabase, auth, id, body }) {
     data: {
       job_id: id,
       status: updatedJob.row.status,
-      translation_result: translationInsert.row
+      processing_strategy: strategy,
+      translation_result: toTranslationResultDto(translationInsert.row)
     }
   };
 }
@@ -1500,7 +1680,7 @@ export async function reviewPropertyIngestJob({ supabase, auth, id, body }) {
     data: {
       job_id: id,
       status: updatedJob.row.status,
-      review_decision: decisionInsert.row
+      review_decision: toReviewDecisionDto(decisionInsert.row)
     }
   };
 }
@@ -1513,21 +1693,11 @@ export async function approvePropertyIngestJob({ supabase, auth, id, body }) {
   if (!job.ok) return job;
 
   if (job.row.status === 'approved') {
-    return {
-      ok: false,
-      status: 409,
-      code: 'PROPERTY_INGEST_ALREADY_APPROVED',
-      message: 'Property ingest job has already been approved.'
-    };
+    return { ok: false, status: 409, code: 'PROPERTY_INGEST_ALREADY_APPROVED', message: 'Property ingest job has already been approved.' };
   }
 
   if (job.row.status === 'rejected') {
-    return {
-      ok: false,
-      status: 409,
-      code: 'PROPERTY_INGEST_REJECTED',
-      message: 'Rejected property ingest jobs cannot be approved.'
-    };
+    return { ok: false, status: 409, code: 'PROPERTY_INGEST_REJECTED', message: 'Rejected property ingest jobs cannot be approved.' };
   }
 
   if (!new Set(['translated', 'pending_review']).has(job.row.status)) {
