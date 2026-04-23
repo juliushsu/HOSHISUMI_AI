@@ -27,6 +27,8 @@ import { respondError, respondOk } from './lib/http.js';
 
 const app = express();
 const port = Number(process.env.PORT || 8080);
+const buildMarker = 'ai-assistant-route-v1';
+const commitHint = '456c3fd';
 const appEnv = String(process.env.APP_ENV || process.env.NODE_ENV || '').toLowerCase();
 const railwayProjectName = String(process.env.RAILWAY_PROJECT_NAME || '').toLowerCase();
 const isStaging = appEnv === 'staging' || railwayProjectName.includes('staging');
@@ -108,7 +110,11 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/api/health', (_req, res) => {
-  return respondOk(res, { status: 'ok' });
+  return respondOk(res, {
+    status: 'ok',
+    build_marker: buildMarker,
+    commit_hint: commitHint
+  });
 });
 
 app.use('/api/leads', leadsRouter);
@@ -122,6 +128,11 @@ app.use('/api/admin/import-batches', requireAuth, adminImportBatchesRouter);
 app.use('/api/admin/intake-cases', requireAuth, adminIntakeCasesRouter);
 app.use('/api/admin/property-ingest/jobs', requireAuth, adminPropertyIngestJobsRouter);
 app.use('/api/admin/ai-assistant', requireStagingFeature, requireAuth, adminAiAssistantRouter);
+console.log('admin ai assistant route mounted', {
+  path: '/api/admin/ai-assistant',
+  build_marker: buildMarker,
+  commit_hint: commitHint
+});
 app.use('/api/clients', requireAuth, clientsRouter);
 app.use('/api/properties', requireAuth, propertiesRouter);
 app.use('/api/partners', requireAuth, partnersRouter);
