@@ -1525,6 +1525,27 @@ export async function runPropertyIngestTranslate({ supabase, auth, id, body }) {
     };
   }
 
+  if (strategy === 'ocr_then_ai') {
+    if (!normalizeOptionalString(job.row.current_ocr_text_ja, 60000)) {
+      if (new Set(['failed', 'unconfigured']).has(job.row.ocr_status)) {
+        await updateJobRow(supabase, id, {
+          status: 'failed',
+          processing_strategy: strategy,
+          translation_status: 'failed',
+          failure_code: job.row.failure_code || 'PROPERTY_INGEST_TRANSLATION_INPUT_MISSING',
+          failure_message: job.row.failure_message || 'Run OCR successfully before translation.'
+        });
+      }
+
+      return {
+        ok: false,
+        status: 400,
+        code: 'PROPERTY_INGEST_TRANSLATION_INPUT_MISSING',
+        message: 'Run OCR successfully before translation.'
+      };
+    }
+  }
+
   const statusBeforeCall = strategy === 'vision_only_fallback' ? 'vision_fallback_processing' : 'translating';
   const jobInProgress = await updateJobRow(supabase, id, {
     status: statusBeforeCall,
@@ -1537,15 +1558,6 @@ export async function runPropertyIngestTranslate({ supabase, auth, id, body }) {
 
   let translation;
   if (strategy === 'ocr_then_ai') {
-    if (!normalizeOptionalString(job.row.current_ocr_text_ja, 60000)) {
-      return {
-        ok: false,
-        status: 400,
-        code: 'PROPERTY_INGEST_TRANSLATION_INPUT_MISSING',
-        message: 'Run OCR successfully before translation.'
-      };
-    }
-
     translation = await translatePropertyFields({
       rawTextJa: job.row.current_ocr_text_ja,
       blocks: Array.isArray(job.row.current_ocr_blocks_json) ? job.row.current_ocr_blocks_json : [],

@@ -7,7 +7,7 @@ import {
   safeParseJSON
 } from './strategyUtils.js';
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY_STAGING || process.env.OPENAI_API_KEY_DEV;
 const TRANSLATOR_PROVIDER = String(process.env.PROPERTY_INGEST_TRANSLATOR_PROVIDER || '').trim().toLowerCase();
 const OPENAI_MODEL = process.env.PROPERTY_INGEST_TRANSLATOR_MODEL || process.env.PROPERTY_INTAKE_PARSE_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
