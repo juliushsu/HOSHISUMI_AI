@@ -20,6 +20,7 @@ import adminImportBatchesRouter from './routes/adminImportBatches.js';
 import adminIntakeCasesRouter from './routes/adminIntakeCases.js';
 import adminPropertyIngestJobsRouter from './routes/adminPropertyIngestJobs.js';
 import adminAiAssistantRouter from './routes/adminAiAssistant.js';
+import partnerPropertiesRouter from './routes/partnerProperties.js';
 import publicInquiriesRouter from './routes/publicInquiries.js';
 import adminInquiriesRouter from './routes/adminInquiries.js';
 import { requireAuth } from './middleware/auth.js';
@@ -128,6 +129,7 @@ app.use('/api/admin/import-batches', requireAuth, adminImportBatchesRouter);
 app.use('/api/admin/intake-cases', requireAuth, adminIntakeCasesRouter);
 app.use('/api/admin/property-ingest/jobs', requireAuth, adminPropertyIngestJobsRouter);
 app.use('/api/admin/ai-assistant', requireStagingFeature, express.json({ limit: '1mb' }), requireAuth, adminAiAssistantRouter);
+app.use('/api/partner/properties', requireStagingFeature, requireAuth, partnerPropertiesRouter);
 console.log('admin ai assistant route mounted', {
   path: '/api/admin/ai-assistant',
   build_marker: buildMarker,
