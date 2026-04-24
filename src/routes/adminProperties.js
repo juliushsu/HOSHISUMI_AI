@@ -7,6 +7,7 @@ import {
   isDemoSeedRow,
   scopedOrganizationId
 } from '../services/demoScope.js';
+import { applyPropertyMediaFallback, fetchIngestPreviewMediaByPropertyIds } from '../services/propertyMedia.js';
 
 const ALLOWED_ROLES = new Set(['owner', 'super_admin', 'manager', 'store_manager', 'store_editor']);
 const COUNTRY_ENUM = new Set(['tw', 'jp']);
@@ -214,6 +215,9 @@ function toPropertyMasterDto(row) {
     cover_image_url: row.cover_image_url ?? null,
     floorplan_image_url: row.floorplan_image_url ?? null,
     gallery_urls: row.gallery_urls ?? [],
+    primary_image_url: row.cover_image_url ?? (Array.isArray(row.gallery_urls) ? row.gallery_urls[0] ?? null : null),
+    image_url: row.cover_image_url ?? (Array.isArray(row.gallery_urls) ? row.gallery_urls[0] ?? null : null),
+    property_media: [],
     raw_source_payload: row.raw_source_payload ?? null,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -294,17 +298,26 @@ router.get('/', async (req, res) => {
   }
 
   const total = Number(count ?? 0);
-  return respondOk(
-    res,
-    (data ?? []).map(toPropertyMasterDto),
-    200,
-    {
-      page,
-      limit,
-      total,
-      total_pages: total === 0 ? 0 : Math.ceil(total / limit)
-    }
-  );
+  try {
+    const baseRows = (data ?? []).map(toPropertyMasterDto);
+    const previewMediaByPropertyId = await fetchIngestPreviewMediaByPropertyIds(baseRows.map((row) => row.id));
+    const rows = baseRows.map((row) => applyPropertyMediaFallback(row, previewMediaByPropertyId.get(row.id) ?? [], 'admin'));
+    return respondOk(
+      res,
+      rows,
+      200,
+      {
+        page,
+        limit,
+        total,
+        total_pages: total === 0 ? 0 : Math.ceil(total / limit)
+      }
+    );
+  } catch (mediaError) {
+    return respondError(res, 500, 'ADMIN_PROPERTY_MEDIA_ENRICH_FAILED', 'Failed to build property media previews.', {
+      message: mediaError instanceof Error ? mediaError.message : 'Unknown property media error.'
+    });
+  }
 });
 
 router.get('/:id', async (req, res) => {
@@ -328,7 +341,16 @@ router.get('/:id', async (req, res) => {
   }
 
   if (!data) return respondError(res, 404, 'ADMIN_PROPERTY_NOT_FOUND', 'Property not found.');
-  return respondOk(res, toPropertyMasterDto(data));
+
+  try {
+    const baseRow = toPropertyMasterDto(data);
+    const previewMediaByPropertyId = await fetchIngestPreviewMediaByPropertyIds([baseRow.id]);
+    return respondOk(res, applyPropertyMediaFallback(baseRow, previewMediaByPropertyId.get(baseRow.id) ?? [], 'admin'));
+  } catch (mediaError) {
+    return respondError(res, 500, 'ADMIN_PROPERTY_MEDIA_ENRICH_FAILED', 'Failed to build property media previews.', {
+      message: mediaError instanceof Error ? mediaError.message : 'Unknown property media error.'
+    });
+  }
 });
 
 router.post('/', async (req, res) => {

@@ -7,6 +7,7 @@ import {
   isDemoSeedRow,
   scopedOrganizationId
 } from '../services/demoScope.js';
+import { applyPropertyMediaFallback, fetchIngestPreviewMediaByPropertyIds } from '../services/propertyMedia.js';
 
 // API contract: country enum (canonical) for GET/POST /api/properties.
 const COUNTRY_TYPES = new Set(['tw', 'jp']);
@@ -172,7 +173,15 @@ router.get('/', async (req, res) => {
     });
   }
 
-  return respondOk(res, data);
+  try {
+    const previewMediaByPropertyId = await fetchIngestPreviewMediaByPropertyIds((data ?? []).map((row) => row.id));
+    const rows = (data ?? []).map((row) => applyPropertyMediaFallback(row, previewMediaByPropertyId.get(row.id) ?? [], 'public'));
+    return respondOk(res, rows);
+  } catch (mediaError) {
+    return respondError(res, 500, 'PROPERTY_MEDIA_ENRICH_FAILED', 'Failed to build property media previews.', {
+      message: mediaError instanceof Error ? mediaError.message : 'Unknown property media error.'
+    });
+  }
 });
 
 router.post('/', async (req, res) => {
