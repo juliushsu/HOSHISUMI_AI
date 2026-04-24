@@ -215,15 +215,6 @@ async function fetchProperty(req, propertyId) {
     return { ok: false, status: 404, code: 'PROPERTY_NOT_FOUND', message: 'Property not found.' };
   }
 
-  if (data.country !== 'tw') {
-    return {
-      ok: false,
-      status: 400,
-      code: 'PROPERTY_COUNTRY_NOT_SUPPORTED',
-      message: 'AI assistant quota applies only to Taiwan-side tenant property analysis.'
-    };
-  }
-
   return { ok: true, property: data };
 }
 

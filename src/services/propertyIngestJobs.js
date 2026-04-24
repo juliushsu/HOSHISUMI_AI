@@ -120,6 +120,14 @@ function parsePaging(rawPage, rawLimit, defaultLimit = 20, maxLimit = 100) {
   return { page: safePage, limit: safeLimit };
 }
 
+function parseIsoDateTime(value) {
+  const normalized = normalizeOptionalText(value, 100);
+  if (!normalized) return normalized;
+  const timestamp = Date.parse(normalized);
+  if (Number.isNaN(timestamp)) return undefined;
+  return new Date(timestamp).toISOString();
+}
+
 function normalizeEnvironmentType() {
   const appEnv = String(process.env.APP_ENV || process.env.NODE_ENV || '').toLowerCase();
   const railwayProjectName = String(process.env.RAILWAY_PROJECT_NAME || '').toLowerCase();
@@ -259,6 +267,16 @@ function buildPreview(row) {
   };
 }
 
+function buildOperationMeta(meta = {}) {
+  return {
+    duplicate_detected: false,
+    duplicate_candidates: null,
+    auto_process: false,
+    processing_mode: 'manual',
+    ...meta
+  };
+}
+
 function toFileDto(row) {
   return {
     id: row.id,
@@ -361,6 +379,10 @@ function toJobListDto(row) {
     raw_file_name: row.primary_file_name ?? null,
     raw_file_mime_type: row.primary_file_mime_type ?? null,
     raw_file_size_bytes: row.primary_file_size_bytes ?? null,
+    duplicate_detected: false,
+    duplicate_of_job_id: null,
+    auto_process: false,
+    processing_mode: 'manual',
     created_at: row.created_at,
     updated_at: row.updated_at,
     preview: buildPreview(row)
@@ -398,6 +420,10 @@ function toJobDetailDto(row, extras) {
         total_tokens: row.token_total_count ?? null
       },
       estimated_cost_usd: row.estimated_cost_usd ?? null,
+      duplicate_detected: false,
+      duplicate_candidates: null,
+      auto_process: false,
+      processing_mode: 'manual',
       failure_code: row.failure_code ?? null,
       failure_message: row.failure_message ?? null,
       current_ocr_text_ja: row.current_ocr_text_ja ?? null,
@@ -755,6 +781,239 @@ async function fetchReviewHistory(supabase, jobId) {
   }
 
   return { ok: true, rows: data ?? [] };
+}
+
+async function fetchPublicationCountForProperty(serviceSupabase, propertyId) {
+  if (!propertyId) return { ok: true, count: 0 };
+
+  const { count, error } = await serviceSupabase
+    .from('store_property_publications')
+    .select('id', { count: 'exact', head: true })
+    .eq('property_id', propertyId);
+
+  if (error) {
+    return {
+      ok: false,
+      status: 500,
+      code: 'PROPERTY_INGEST_PUBLICATION_CHECK_FAILED',
+      message: 'Failed to validate whether approved property is published.',
+      details: { supabase_error: error.message }
+    };
+  }
+
+  return { ok: true, count: Number(count ?? 0) };
+}
+
+async function resolveDeleteEligibility({ serviceSupabase, job }) {
+  if (job.row.status === 'approved' || job.row.approved_property_id) {
+    const publicationCheck = await fetchPublicationCountForProperty(serviceSupabase, job.row.approved_property_id);
+    if (!publicationCheck.ok) return publicationCheck;
+
+    return {
+      ok: false,
+      status: 409,
+      code: 'PROPERTY_INGEST_DELETE_FORBIDDEN',
+      message: 'Approved or published property ingest jobs cannot be deleted.',
+      details: {
+        job_status: job.row.status,
+        approved_property_id: job.row.approved_property_id ?? null,
+        publication_count: publicationCheck.count
+      }
+    };
+  }
+
+  const deleteAllowed = new Set(['uploaded', 'failed']).has(job.row.status)
+    || job.row.ocr_status === 'unconfigured'
+    || job.row.translation_status === 'unconfigured';
+
+  if (!deleteAllowed) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'PROPERTY_INGEST_DELETE_NOT_ALLOWED',
+      message: 'Only uploaded, failed, or unconfigured property ingest jobs can be deleted.',
+      details: {
+        job_status: job.row.status,
+        ocr_status: job.row.ocr_status,
+        translation_status: job.row.translation_status
+      }
+    };
+  }
+
+  return { ok: true };
+}
+
+async function fetchDeleteGraph(serviceSupabase, jobId) {
+  const [filesResult, ocrResult, translationResult, reviewResult] = await Promise.all([
+    serviceSupabase
+      .from('property_ingest_files')
+      .select('id,storage_bucket,storage_path')
+      .eq('job_id', jobId),
+    serviceSupabase
+      .from('property_ocr_results')
+      .select('id')
+      .eq('job_id', jobId),
+    serviceSupabase
+      .from('property_translation_results')
+      .select('id')
+      .eq('job_id', jobId),
+    serviceSupabase
+      .from('property_review_decisions')
+      .select('id')
+      .eq('job_id', jobId)
+  ]);
+
+  const errors = [filesResult.error, ocrResult.error, translationResult.error, reviewResult.error].filter(Boolean);
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      status: 500,
+      code: 'PROPERTY_INGEST_DELETE_GRAPH_FETCH_FAILED',
+      message: 'Failed to fetch property ingest delete graph.',
+      details: { supabase_error: errors[0].message }
+    };
+  }
+
+  return {
+    ok: true,
+    files: filesResult.data ?? [],
+    ocrResults: ocrResult.data ?? [],
+    translationResults: translationResult.data ?? [],
+    reviewDecisions: reviewResult.data ?? []
+  };
+}
+
+async function cleanupStoragePaths(serviceSupabase, files) {
+  const groupedPaths = new Map();
+  for (const file of files) {
+    if (!file?.storage_bucket || !file?.storage_path) continue;
+    if (!groupedPaths.has(file.storage_bucket)) groupedPaths.set(file.storage_bucket, []);
+    groupedPaths.get(file.storage_bucket).push(file.storage_path);
+  }
+
+  const removedPaths = [];
+  const failedPaths = [];
+
+  for (const [bucket, paths] of groupedPaths.entries()) {
+    if (paths.length === 0) continue;
+    try {
+      const { error } = await serviceSupabase.storage.from(bucket).remove(paths);
+      if (error) {
+        for (const path of paths) failedPaths.push(path);
+      } else {
+        for (const path of paths) removedPaths.push(path);
+      }
+    } catch {
+      for (const path of paths) failedPaths.push(path);
+    }
+  }
+
+  return {
+    attempted: groupedPaths.size > 0,
+    removed_paths: removedPaths,
+    failed_paths: failedPaths
+  };
+}
+
+async function deleteJobGraph({ serviceSupabase, jobId }) {
+  const { data, error } = await serviceSupabase
+    .from('property_ingest_jobs')
+    .delete()
+    .eq('id', jobId)
+    .select('id')
+    .maybeSingle();
+
+  if (error) {
+    return {
+      ok: false,
+      status: 500,
+      code: 'PROPERTY_INGEST_DELETE_FAILED',
+      message: 'Failed to delete property ingest job.',
+      details: { supabase_error: error.message }
+    };
+  }
+
+  if (!data) {
+    return {
+      ok: false,
+      status: 404,
+      code: 'PROPERTY_INGEST_JOB_NOT_FOUND',
+      message: 'Property ingest job not found in current scope.'
+    };
+  }
+
+  return { ok: true };
+}
+
+async function deleteSinglePropertyIngestJob({ supabase, auth, id, requestedStoreId = null, deleteOptions = {} }) {
+  const access = assertIngestAccessAllowed({ auth, requiresWrite: true });
+  if (!access.ok) return access;
+
+  const job = await fetchJobInScope({ supabase, auth, id, requestedStoreId });
+  if (!job.ok) return job;
+
+  let serviceSupabase;
+  try {
+    serviceSupabase = createServiceSupabase();
+  } catch (error) {
+    return {
+      ok: false,
+      status: 500,
+      code: 'PROPERTY_INGEST_DELETE_SERVICE_NOT_CONFIGURED',
+      message: 'SUPABASE_SERVICE_ROLE_KEY is required for property ingest cleanup.',
+      details: { message: error instanceof Error ? error.message : 'Missing service role key.' }
+    };
+  }
+
+  const eligibility = await resolveDeleteEligibility({ serviceSupabase, job });
+  if (!eligibility.ok) return eligibility;
+
+  const graph = await fetchDeleteGraph(serviceSupabase, id);
+  if (!graph.ok) return graph;
+
+  if (deleteOptions.dryRun === true) {
+    return {
+      ok: true,
+      data: {
+        deleted_job_id: id,
+        deleted: false,
+        dry_run: true,
+        deleted_file_count: graph.files.length,
+        deleted_ocr_result_count: graph.ocrResults.length,
+        deleted_translation_result_count: graph.translationResults.length,
+        deleted_review_decision_count: graph.reviewDecisions.length,
+        storage_cleanup: {
+          attempted: graph.files.length > 0,
+          removed_paths: [],
+          failed_paths: []
+        }
+      }
+    };
+  }
+
+  const deleteResult = await deleteJobGraph({ serviceSupabase, jobId: id });
+  if (!deleteResult.ok) return deleteResult;
+
+  const storageCleanup = await cleanupStoragePaths(serviceSupabase, graph.files);
+  return {
+    ok: true,
+    data: {
+      deleted_job_id: id,
+      deleted: true,
+      dry_run: false,
+      deleted_file_count: graph.files.length,
+      deleted_ocr_result_count: graph.ocrResults.length,
+      deleted_translation_result_count: graph.translationResults.length,
+      deleted_review_decision_count: graph.reviewDecisions.length,
+      storage_cleanup: storageCleanup
+    },
+    meta: storageCleanup.failed_paths.length > 0
+      ? {
+          warning_code: 'PROPERTY_INGEST_STORAGE_CLEANUP_PARTIAL',
+          failed_storage_paths: storageCleanup.failed_paths
+        }
+      : null
+  };
 }
 
 async function buildFileAccess(fileRow) {
@@ -1273,7 +1532,8 @@ export async function createPropertyIngestJob({ supabase, auth, body, file }) {
         fileAccess: await buildFileAccess(fileRow)
       }).job,
       file: toFileDto(fileRow)
-    }
+    },
+    meta: buildOperationMeta()
   };
 }
 
@@ -1284,7 +1544,7 @@ export async function listPropertyIngestJobs({ supabase, auth, query }) {
   const scope = await resolveAdminScope({ supabase, auth, requestedStoreId: query.store_id ?? null });
   if (!scope.ok) return scope;
 
-  const { page, limit } = parsePaging(query.page, query.limit);
+  const { page, limit } = parsePaging(query.page, query.pageSize ?? query.page_size ?? query.limit);
   const from = (page - 1) * limit;
   const to = from + limit - 1;
 
@@ -1310,6 +1570,32 @@ export async function listPropertyIngestJobs({ supabase, auth, query }) {
     request = request.eq('status', status);
   }
 
+  if (query.ocr_status) {
+    const ocrStatus = String(query.ocr_status);
+    if (!new Set(['pending', 'processing', 'done', 'failed', 'unconfigured']).has(ocrStatus)) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'INVALID_OCR_STATUS',
+        message: 'ocr_status filter must be pending/processing/done/failed/unconfigured.'
+      };
+    }
+    request = request.eq('ocr_status', ocrStatus);
+  }
+
+  if (query.translation_status) {
+    const translationStatus = String(query.translation_status);
+    if (!new Set(['pending', 'processing', 'done', 'failed', 'unconfigured']).has(translationStatus)) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'INVALID_TRANSLATION_STATUS',
+        message: 'translation_status filter must be pending/processing/done/failed/unconfigured.'
+      };
+    }
+    request = request.eq('translation_status', translationStatus);
+  }
+
   if (query.processing_strategy) {
     const processingStrategy = String(query.processing_strategy);
     if (!PROCESSING_STRATEGY_ENUM.has(processingStrategy)) {
@@ -1328,6 +1614,28 @@ export async function listPropertyIngestJobs({ supabase, auth, query }) {
     request = request.or(`primary_file_name.ilike.%${search}%,current_ocr_text_ja.ilike.%${search}%`);
   }
 
+  const createdFrom = parseIsoDateTime(query.created_from);
+  if (query.created_from !== undefined && createdFrom === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_CREATED_FROM',
+      message: 'created_from must be a valid ISO datetime string.'
+    };
+  }
+  if (createdFrom) request = request.gte('created_at', createdFrom);
+
+  const createdTo = parseIsoDateTime(query.created_to);
+  if (query.created_to !== undefined && createdTo === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_CREATED_TO',
+      message: 'created_to must be a valid ISO datetime string.'
+    };
+  }
+  if (createdTo) request = request.lte('created_at', createdTo);
+
   const { data, error, count } = await request;
   if (error) {
     return {
@@ -1343,12 +1651,14 @@ export async function listPropertyIngestJobs({ supabase, auth, query }) {
   return {
     ok: true,
     data: (data ?? []).map(toJobListDto),
-    meta: {
+    meta: buildOperationMeta({
       page,
+      pageSize: limit,
+      page_size: limit,
       limit,
       total,
       total_pages: total === 0 ? 0 : Math.ceil(total / limit)
-    }
+    })
   };
 }
 
@@ -1380,7 +1690,8 @@ export async function getPropertyIngestJobDetail({ supabase, auth, id, requested
       latestTranslationResult: translationResult.row,
       reviewHistory: reviewHistory.rows,
       fileAccess
-    })
+    }),
+    meta: buildOperationMeta()
   };
 }
 
@@ -1774,5 +2085,237 @@ export async function approvePropertyIngestJob({ supabase, auth, id, body }) {
       status: updatedJob.row.status,
       approved_property: propertyRow
     }
+  };
+}
+
+export function validateBulkDeleteInput(body) {
+  if (!isPlainObject(body)) {
+    return { ok: false, status: 400, code: 'INVALID_BODY', message: 'Request body must be a JSON object.' };
+  }
+
+  const jobIds = Array.isArray(body.job_ids) ? body.job_ids : null;
+  if (!jobIds || jobIds.length === 0) {
+    return { ok: false, status: 400, code: 'INVALID_JOB_IDS', message: 'job_ids must be a non-empty UUID array.' };
+  }
+
+  const normalizedJobIds = [];
+  for (const value of jobIds) {
+    const normalized = normalizeUuid(value);
+    if (!normalized) {
+      return { ok: false, status: 400, code: 'INVALID_JOB_IDS', message: 'job_ids must contain only UUID strings.' };
+    }
+    normalizedJobIds.push(normalized);
+  }
+
+  const requestedStoreId = body.store_id === undefined ? null : normalizeUuid(body.store_id);
+  if (body.store_id !== undefined && body.store_id !== '' && requestedStoreId === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_STORE_ID',
+      message: 'store_id must be a UUID string when provided.'
+    };
+  }
+
+  return {
+    ok: true,
+    input: {
+      job_ids: [...new Set(normalizedJobIds)],
+      requested_store_id: requestedStoreId ?? null,
+      dry_run: body.dry_run === true
+    }
+  };
+}
+
+export function validateDeleteFailedInput(body) {
+  if (body == null || body === '') {
+    return {
+      ok: true,
+      input: {
+        requested_store_id: null,
+        created_before: null,
+        statuses: ['failed', 'uploaded'],
+        include_unconfigured: true,
+        dry_run: false
+      }
+    };
+  }
+
+  if (!isPlainObject(body)) {
+    return { ok: false, status: 400, code: 'INVALID_BODY', message: 'Request body must be a JSON object.' };
+  }
+
+  const requestedStoreId = body.store_id === undefined ? null : normalizeUuid(body.store_id);
+  if (body.store_id !== undefined && body.store_id !== '' && requestedStoreId === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_STORE_ID',
+      message: 'store_id must be a UUID string when provided.'
+    };
+  }
+
+  const createdBefore = parseIsoDateTime(body.created_before);
+  if (body.created_before !== undefined && createdBefore === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_CREATED_BEFORE',
+      message: 'created_before must be a valid ISO datetime string when provided.'
+    };
+  }
+
+  const statuses = body.statuses === undefined ? ['failed', 'uploaded'] : body.statuses;
+  if (!Array.isArray(statuses) || statuses.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_STATUSES',
+      message: 'statuses must be a non-empty array when provided.'
+    };
+  }
+
+  const normalizedStatuses = [];
+  for (const status of statuses) {
+    const normalized = normalizeOptionalText(status, 40);
+    if (!normalized || !new Set(['failed', 'uploaded']).has(normalized)) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'INVALID_STATUSES',
+        message: 'statuses may only include failed/uploaded.'
+      };
+    }
+    normalizedStatuses.push(normalized);
+  }
+
+  return {
+    ok: true,
+    input: {
+      requested_store_id: requestedStoreId ?? null,
+      created_before: createdBefore ?? null,
+      statuses: [...new Set(normalizedStatuses)],
+      include_unconfigured: body.include_unconfigured !== false,
+      dry_run: body.dry_run === true
+    }
+  };
+}
+
+export async function deletePropertyIngestJob({ supabase, auth, id, requestedStoreId = null }) {
+  return deleteSinglePropertyIngestJob({ supabase, auth, id, requestedStoreId });
+}
+
+export async function bulkDeletePropertyIngestJobs({ supabase, auth, body }) {
+  const results = [];
+  let deletedCount = 0;
+  let skippedCount = 0;
+  let matchedCount = 0;
+
+  for (const jobId of body.job_ids) {
+    const result = await deleteSinglePropertyIngestJob({
+      supabase,
+      auth,
+      id: jobId,
+      requestedStoreId: body.requested_store_id,
+      deleteOptions: { dryRun: body.dry_run }
+    });
+
+    if (result.ok) {
+      matchedCount += 1;
+      if (body.dry_run) {
+        results.push({
+          job_id: jobId,
+          status: 'matched',
+          dry_run: true
+        });
+      } else {
+        deletedCount += 1;
+        results.push({
+          job_id: jobId,
+          status: 'deleted'
+        });
+      }
+      continue;
+    }
+
+    skippedCount += 1;
+    results.push({
+      job_id: jobId,
+      status: 'skipped',
+      reason_code: result.code,
+      reason_message: result.message
+    });
+  }
+
+  return {
+    ok: true,
+    data: {
+      requested_count: body.job_ids.length,
+      matched_count: matchedCount,
+      deleted_count: deletedCount,
+      skipped_count: skippedCount,
+      dry_run: body.dry_run,
+      results
+    },
+    meta: buildOperationMeta()
+  };
+}
+
+export async function deleteFailedPropertyIngestJobs({ supabase, auth, body }) {
+  const access = assertIngestAccessAllowed({ auth, requiresWrite: true });
+  if (!access.ok) return access;
+
+  const scope = await resolveAdminScope({ supabase, auth, requestedStoreId: body.requested_store_id });
+  if (!scope.ok) return scope;
+
+  let request = supabase
+    .from('property_ingest_jobs')
+    .select('id,status,ocr_status,translation_status,created_at')
+    .eq('organization_id', auth.organizationId)
+    .in('status', body.statuses)
+    .order('created_at', { ascending: false });
+
+  if (scope.store_id) request = request.eq('store_id', scope.store_id);
+  if (body.created_before) request = request.lte('created_at', body.created_before);
+
+  const { data, error } = await request;
+  if (error) {
+    return {
+      ok: false,
+      status: 500,
+      code: 'PROPERTY_INGEST_DELETE_FAILED_FETCH_FAILED',
+      message: 'Failed to fetch deletable property ingest jobs.',
+      details: { supabase_error: error.message }
+    };
+  }
+
+  const matchedJobs = (data ?? []).filter((row) => {
+    if (body.include_unconfigured) {
+      return row.ocr_status === 'unconfigured' || row.translation_status === 'unconfigured' || body.statuses.includes(row.status);
+    }
+    return body.statuses.includes(row.status);
+  });
+
+  const bulkResult = await bulkDeletePropertyIngestJobs({
+    supabase,
+    auth,
+    body: {
+      job_ids: matchedJobs.map((row) => row.id),
+      requested_store_id: body.requested_store_id,
+      dry_run: body.dry_run
+    }
+  });
+  if (!bulkResult.ok) return bulkResult;
+
+  return {
+    ok: true,
+    data: {
+      matched_count: matchedJobs.length,
+      deleted_count: bulkResult.data.deleted_count,
+      skipped_count: bulkResult.data.skipped_count,
+      dry_run: body.dry_run,
+      results: bulkResult.data.results
+    },
+    meta: buildOperationMeta()
   };
 }

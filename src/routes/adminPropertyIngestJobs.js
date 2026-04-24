@@ -2,6 +2,9 @@ import multer from 'multer';
 import { Router } from 'express';
 import { respondError, respondOk } from '../lib/http.js';
 import {
+  bulkDeletePropertyIngestJobs,
+  deleteFailedPropertyIngestJobs,
+  deletePropertyIngestJob,
   PROPERTY_INGEST_MAX_FILE_BYTES,
   approvePropertyIngestJob,
   createPropertyIngestJob,
@@ -11,7 +14,9 @@ import {
   runPropertyIngestOcr,
   runPropertyIngestTranslate,
   validateApproveInput,
+  validateBulkDeleteInput,
   validateCreateInput,
+  validateDeleteFailedInput,
   validateReviewInput,
   validateRunInput,
   validateTranslateInput
@@ -42,7 +47,7 @@ router.post('/', upload.single('file'), async (req, res) => {
     return respondError(res, result.status, result.code, result.message, result.details ?? null);
   }
 
-  return respondOk(res, result.data, result.status);
+  return respondOk(res, result.data, result.status, result.meta ?? null);
 });
 
 router.get('/', async (req, res) => {
@@ -71,7 +76,7 @@ router.get('/:id', async (req, res) => {
     return respondError(res, result.status, result.code, result.message, result.details ?? null);
   }
 
-  return respondOk(res, result.data);
+  return respondOk(res, result.data, 200, result.meta ?? null);
 });
 
 router.post('/:id/run-ocr', async (req, res) => {
@@ -155,6 +160,59 @@ router.post('/:id/approve', async (req, res) => {
   }
 
   return respondOk(res, result.data);
+});
+
+router.delete('/:id', async (req, res) => {
+  const result = await deletePropertyIngestJob({
+    supabase: req.supabase,
+    auth: req.auth,
+    id: req.params.id,
+    requestedStoreId: req.query.store_id ?? null
+  });
+
+  if (!result.ok) {
+    return respondError(res, result.status, result.code, result.message, result.details ?? null);
+  }
+
+  return respondOk(res, result.data, 200, result.meta ?? null);
+});
+
+router.post('/bulk-delete', async (req, res) => {
+  const validation = validateBulkDeleteInput(req.body || {});
+  if (!validation.ok) {
+    return respondError(res, validation.status, validation.code, validation.message, validation.details ?? null);
+  }
+
+  const result = await bulkDeletePropertyIngestJobs({
+    supabase: req.supabase,
+    auth: req.auth,
+    body: validation.input
+  });
+
+  if (!result.ok) {
+    return respondError(res, result.status, result.code, result.message, result.details ?? null);
+  }
+
+  return respondOk(res, result.data, 200, result.meta ?? null);
+});
+
+router.post('/delete-failed', async (req, res) => {
+  const validation = validateDeleteFailedInput(req.body || {});
+  if (!validation.ok) {
+    return respondError(res, validation.status, validation.code, validation.message, validation.details ?? null);
+  }
+
+  const result = await deleteFailedPropertyIngestJobs({
+    supabase: req.supabase,
+    auth: req.auth,
+    body: validation.input
+  });
+
+  if (!result.ok) {
+    return respondError(res, result.status, result.code, result.message, result.details ?? null);
+  }
+
+  return respondOk(res, result.data, 200, result.meta ?? null);
 });
 
 router.use((error, _req, res, _next) => {
