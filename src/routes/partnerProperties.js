@@ -49,6 +49,7 @@ const MASTER_SELECT = [
 ].join(',');
 
 const router = Router();
+const DEBUG_AGENT_ROLES = new Set(['owner', 'super_admin']);
 
 function isPlainObject(value) {
   return value != null && typeof value === 'object' && !Array.isArray(value);
@@ -56,6 +57,10 @@ function isPlainObject(value) {
 
 function isUuid(value) {
   return typeof value === 'string' && UUID_RE.test(value);
+}
+
+function canUseDebugPartnerScope(role) {
+  return DEBUG_AGENT_ROLES.has(String(role || '').toLowerCase());
 }
 
 function normalizeOptionalText(value, maxLen = 5000) {
@@ -138,7 +143,7 @@ function toMasterDto(row, bindingSummary = null) {
   };
 }
 
-async function resolvePartnerScope(auth) {
+function createPartnerServiceScope(auth) {
   if (!ALLOWED_AGENT_ROLES.has(String(auth.role || '').toLowerCase())) {
     return {
       ok: false,
@@ -160,6 +165,14 @@ async function resolvePartnerScope(auth) {
       details: { message: error instanceof Error ? error.message : 'Missing service role key.' }
     };
   }
+
+  return { ok: true, serviceSupabase };
+}
+
+async function resolvePartnerScope(auth) {
+  const serviceScope = createPartnerServiceScope(auth);
+  if (!serviceScope.ok) return serviceScope;
+  const { serviceSupabase } = serviceScope;
 
   const { data: membership, error } = await serviceSupabase
     .from('partner_users')
@@ -185,6 +198,42 @@ async function resolvePartnerScope(auth) {
   }
 
   return { ok: true, serviceSupabase, membership };
+}
+
+async function resolvePartnerDebugScope(serviceSupabase, partnerId) {
+  const { data: partner, error } = await serviceSupabase
+    .from('partners')
+    .select('id,company_name,display_name,status,partner_slug')
+    .eq('id', partnerId)
+    .maybeSingle();
+
+  if (error) {
+    const handled = handleModelError(error);
+    return { ok: false, ...handled };
+  }
+
+  if (!partner || partner.status !== 'active') {
+    return {
+      ok: false,
+      status: 404,
+      code: 'DEBUG_PARTNER_NOT_FOUND',
+      message: 'Active debug partner was not found.'
+    };
+  }
+
+  return {
+    ok: true,
+    membership: {
+      id: null,
+      partner_id: partner.id,
+      organization_id: null,
+      agent_id: null,
+      email: null,
+      role: 'debug',
+      is_active: true,
+      partner
+    }
+  };
 }
 
 async function fetchPropertyMasterById(serviceSupabase, partnerId, id) {
@@ -213,19 +262,47 @@ async function fetchPropertyMasterById(serviceSupabase, partnerId, id) {
 }
 
 router.get('/', async (req, res) => {
-  const scope = await resolvePartnerScope(req.auth);
-  if (!scope.ok) {
-    return respondError(res, scope.status, scope.code, scope.message, scope.details ?? null);
+  const debugPartnerId = req.query.debug_partner_id ? String(req.query.debug_partner_id) : null;
+  const serviceScope = createPartnerServiceScope(req.auth);
+  if (!serviceScope.ok) {
+    return respondError(res, serviceScope.status, serviceScope.code, serviceScope.message, serviceScope.details ?? null);
+  }
+
+  let effectiveMembership = null;
+  const serviceSupabase = serviceScope.serviceSupabase;
+  let debugMode = false;
+
+  if (debugPartnerId) {
+    if (!isUuid(debugPartnerId)) {
+      return respondError(res, 400, 'INVALID_DEBUG_PARTNER_ID', 'debug_partner_id must be a UUID.');
+    }
+    if (!canUseDebugPartnerScope(req.auth?.role)) {
+      return respondError(res, 403, 'DEBUG_SCOPE_NOT_ALLOWED', 'Only owner/super_admin may use debug_partner_id.');
+    }
+
+    const debugScope = await resolvePartnerDebugScope(serviceSupabase, debugPartnerId);
+    if (!debugScope.ok) {
+      return respondError(res, debugScope.status, debugScope.code, debugScope.message, debugScope.details ?? null);
+    }
+
+    effectiveMembership = debugScope.membership;
+    debugMode = true;
+  } else {
+    const scope = await resolvePartnerScope(req.auth);
+    if (!scope.ok) {
+      return respondError(res, scope.status, scope.code, scope.message, scope.details ?? null);
+    }
+    effectiveMembership = scope.membership;
   }
 
   const { page, pageSize } = parsePaging(req.query.page, req.query.pageSize ?? req.query.page_size);
   const from = (page - 1) * pageSize;
   const to = from + pageSize - 1;
 
-  let request = scope.serviceSupabase
+  let request = serviceSupabase
     .from('properties_master')
     .select(MASTER_SELECT, { count: 'exact' })
-    .eq('source_partner_id', scope.membership.partner_id)
+    .eq('source_partner_id', effectiveMembership.partner_id)
     .order('updated_at', { ascending: false })
     .range(from, to);
 
@@ -259,10 +336,12 @@ router.get('/', async (req, res) => {
       total: Number(count ?? 0),
       total_pages: Number(count ?? 0) === 0 ? 0 : Math.ceil(Number(count ?? 0) / pageSize),
       partner: {
-        id: scope.membership.partner.id,
-        display_name: scope.membership.partner.display_name,
-        partner_slug: scope.membership.partner.partner_slug
-      }
+        id: effectiveMembership.partner.id,
+        display_name: effectiveMembership.partner.display_name,
+        partner_slug: effectiveMembership.partner.partner_slug
+      },
+      debug_mode: debugMode,
+      debug_partner_id: debugMode ? effectiveMembership.partner.id : null
     }
   );
 });
