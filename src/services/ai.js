@@ -175,6 +175,48 @@ function formatJpy(value, { prefix = '¥', empty = '' } = {}) {
   return `${prefix}${number.toLocaleString()}`;
 }
 
+function getCurrentYear() {
+  return new Date().getUTCFullYear();
+}
+
+function resolveBuildingInfo(property = {}) {
+  const candidates = [
+    property.built_year,
+    property.construction_year,
+    property.building_year,
+    property.year_built,
+    property.building_age
+  ].map((value) => normalizeNullableNumber(value)).filter((value) => value != null);
+
+  const currentYear = getCurrentYear();
+  for (const value of candidates) {
+    if (value >= 1800 && value <= currentYear + 1) {
+      const age = Math.max(currentYear - value, 0);
+      return {
+        built_year: value,
+        age_years: age,
+        label: `${value} 年完工`
+      };
+    }
+  }
+
+  for (const value of candidates) {
+    if (value >= 0 && value <= 200) {
+      return {
+        built_year: null,
+        age_years: value,
+        label: `屋齡約 ${value} 年`
+      };
+    }
+  }
+
+  return {
+    built_year: null,
+    age_years: null,
+    label: ''
+  };
+}
+
 function isWeakSalesLine(value = '') {
   const line = normalizeText(value);
   if (!line) return true;
@@ -437,6 +479,7 @@ function buildPositioningLine(context = {}) {
 
 function buildPropertyConditionLine(property = {}, context = {}) {
   const parts = [];
+  const buildingInfo = resolveBuildingInfo(property);
 
   if (context.listing_mode === 'rental') {
     parts.push(context.is_occupied_rental ? '目前為賃貸中' : '目前可先從租賃條件切入');
@@ -452,8 +495,8 @@ function buildPropertyConditionLine(property = {}, context = {}) {
   if (normalizeNullableNumber(property.area_sqm) != null) {
     parts.push(`專有面積約 ${normalizeNullableNumber(property.area_sqm)} 平方公尺`);
   }
-  if (normalizeNullableNumber(property.building_age) != null) {
-    parts.push(`屋齡約 ${normalizeNullableNumber(property.building_age)} 年`);
+  if (buildingInfo.label) {
+    parts.push(buildingInfo.label);
   }
 
   if (parts.length === 0) {
@@ -471,10 +514,10 @@ function buildAssessmentLine(context = {}) {
   }
 
   if (context.listing_mode === 'rental' && context.rent_jpy != null) {
-    return `現階段先以月租金約 ${formatJpy(context.rent_jpy)}、${context.transit}、屋況與持有條件做初步評估；等總價與完整持有成本補齊後，再做投報試算會更準。`;
+    return `現階段先以月租金、屋況與持有條件做初步評估；等總價與完整持有成本補齊後，再做投報試算會更準。`;
   }
 
-  return `目前可先從 ${context.transit}、${context.lifestyle} 與屋況條件做初步判斷；價格與交易條件補齊後，再進一步比較會更穩健。`;
+  return `目前可先從屋況條件與生活圈做初步判斷；價格與交易條件補齊後，再進一步比較會更穩健。`;
 }
 
 function buildComplianceAndCtaLine(narrative = {}, promptContext = {}) {
@@ -492,7 +535,9 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
   const rentJpy = enrichedAnalysis.monthly_rent_jpy ?? extractRentJpy(property);
   const yieldNarrative = buildYieldNarrative(priceJpy, rentJpy, enrichedAnalysis.gross_yield_pct);
   const locationNarrative = buildLocationNarrative(property, analysis);
+  const buildingInfo = resolveBuildingInfo(property);
   const title = property.title_zh || property.title || property.title_ja || '精選物件';
+  const areaValue = normalizeNullableNumber(property.area_sqm);
   const targetBuyer = pickFirstText(
     enrichedAnalysis.fit_types[0],
     enrichedAnalysis.buyer_personas[0],
@@ -513,6 +558,10 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
     ...enrichedAnalysis.investment_risks,
     ...legacyAnalysis.risk_notes
   ];
+  const shortRisk = riskCandidates.find((line) => {
+    const normalized = normalizeText(line);
+    return normalized && normalized.length <= 28;
+  }) || '仍需核對屋況與持有成本';
   const riskLine = riskCandidates.find((line) => {
     const normalized = normalizeText(line);
     if (!normalized) return false;
@@ -568,6 +617,11 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
     listing_mode: listingMode,
     is_occupied_rental: isOccupiedRental,
     title,
+    layout: normalizeText(property.layout),
+    area_label: areaValue != null ? `專有面積約 ${areaValue}㎡` : '',
+    built_year: buildingInfo.built_year,
+    building_label: buildingInfo.label,
+    short_risk: shortRisk,
     price_jpy: priceJpy,
     rent_jpy: rentJpy,
     gross_yield_pct: yieldNarrative.gross_yield_pct,
@@ -624,10 +678,11 @@ function buildCopyMeta({ analysis = {}, promptContext = {}, usage = {} } = {}) {
 function buildFbNarrativeCopy(narrative, promptContext = {}) {
   const complianceAndCta = buildComplianceAndCtaLine(narrative, promptContext);
   return [
-    narrative.lines.opening,
-    `${narrative.lines.positioning_natural} ${narrative.lines.value}`.trim(),
+    `${narrative.lines.opening} ${narrative.lines.value}`.trim(),
+    narrative.lines.positioning_natural,
     narrative.lines.conditions,
-    `${narrative.lines.assessment} ${narrative.lines.risk}`.trim(),
+    narrative.lines.assessment,
+    `提醒你先留意：${narrative.lines.risk}`,
     complianceAndCta
   ].join('\n\n');
 }
@@ -638,12 +693,20 @@ function buildIgNarrativeCopy(narrative, promptContext = {}) {
     ? `${narrative.title}｜日本收租型物件`
     : `${narrative.title}｜生活圈精選`;
   const bullets = uniqueTextLines([
-    narrative.lines.positioning_natural,
-    narrative.lines.conditions,
+    narrative.lines.transit === '交通資訊仍在補充中' ? '交通資訊補充中' : narrative.lines.transit,
+    narrative.rent_jpy != null ? `月租金約 ${formatJpy(narrative.rent_jpy)}` : '',
+    narrative.price_jpy != null ? `總價約 ${formatJpy(narrative.price_jpy)}` : '',
+    narrative.layout ? `格局 ${narrative.layout}` : '',
+    narrative.area_label,
+    narrative.building_label,
     narrative.lines.value,
-    narrative.lines.assessment,
-    `提醒：${narrative.lines.risk}`
-  ]).slice(0, 5);
+    narrative.listing_mode === 'rental'
+      ? '先看出租定位與持有條件'
+      : '可再補價格做完整比較',
+    `提醒：${narrative.short_risk}`
+  ])
+    .map((item) => item.length > 40 ? `${item.slice(0, 38)}…` : item)
+    .slice(0, 5);
 
   return [
     heading,
@@ -659,7 +722,8 @@ function buildLineNarrativeCopy(narrative, promptContext = {}) {
   const cta = normalizeText(promptContext.cta) || '如果你要，我可以直接整理完整資料和比較表給你。';
   return [
     `${narrative.title} 這間我會先建議你放進比較清單。`,
-    `${narrative.lines.positioning_natural} ${narrative.lines.conditions}`.trim(),
+    narrative.lines.positioning_natural,
+    narrative.lines.conditions,
     narrative.lines.assessment,
     `先提醒你：${narrative.lines.risk}`,
     cta
