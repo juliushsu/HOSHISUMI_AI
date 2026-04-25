@@ -150,10 +150,35 @@ function pickFirstText(...values) {
   return '';
 }
 
+function uniqueTextLines(values = []) {
+  const seen = new Set();
+  return values
+    .map((value) => normalizeText(value))
+    .filter(Boolean)
+    .filter((value) => {
+      const key = value.replace(/\s+/g, ' ').trim();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 function normalizeNullableNumber(value) {
   if (value == null || value === '') return null;
   const number = Number(String(value).replace(/[^0-9.-]/g, ''));
   return Number.isFinite(number) ? number : null;
+}
+
+function formatJpy(value, { prefix = '¥', empty = '' } = {}) {
+  const number = normalizeNullableNumber(value);
+  if (number == null) return empty;
+  return `${prefix}${number.toLocaleString()}`;
+}
+
+function isWeakSalesLine(value = '') {
+  const line = normalizeText(value);
+  if (!line) return true;
+  return /可作為主要溝通切入點|可先從車站距離與出租定位切入|日本物件可作為/.test(line);
 }
 
 function normalizeAnalysisShape(parsed) {
@@ -316,12 +341,6 @@ function extractPriceJpy(property = {}) {
 function buildLocationNarrative(property = {}, analysis = {}) {
   const legacy = normalizeLegacyAnalysis(analysis);
   const enriched = normalizeEnrichedAnalysis(analysis);
-  const localityAngles = [
-    enriched.lifestyle_summary,
-    ...enriched.poi_200m_highlights,
-    ...enriched.poi_500m_highlights,
-    ...legacy.locality_angles
-  ].filter(Boolean);
   const transitLabel = pickFirstText(
     enriched.transit_station,
     property.nearest_station
@@ -329,12 +348,22 @@ function buildLocationNarrative(property = {}, analysis = {}) {
   const walkMinutes = normalizeNullableNumber(
     enriched.transit_walk_minutes ?? property.walking_minutes
   );
+  const transitLine = transitLabel
+    ? `${transitLabel}${walkMinutes != null ? `，步行約 ${walkMinutes} 分鐘` : ''}`
+    : '交通資訊仍在補充中';
+  const localityAngles = uniqueTextLines([
+    enriched.lifestyle_summary,
+    ...enriched.poi_200m_highlights,
+    ...enriched.poi_500m_highlights,
+    ...legacy.locality_angles
+  ]).filter((item) => {
+    if (!transitLabel) return true;
+    return item !== transitLine && !item.includes(transitLabel);
+  });
 
   return {
     short_label: detectCountry(property) === 'jp' ? '日本物件' : '台灣物件',
-    transit_line: transitLabel
-      ? `${transitLabel}${walkMinutes != null ? `，步行約 ${walkMinutes} 分鐘` : ''}`
-      : (detectCountry(property) === 'jp' ? '交通資訊仍在補充中' : '交通資訊仍在補充中'),
+    transit_line: transitLine,
     lifestyle_line: localityAngles[0] || '周邊生活機能資料尚待補強',
     is_transit_missing: !transitLabel,
     is_lifestyle_missing: localityAngles.length === 0
@@ -358,11 +387,107 @@ function buildYieldNarrative(priceJpy, rentJpy, explicitGrossYield = null) {
   };
 }
 
+function detectRentalOccupancy(property = {}) {
+  const source = [
+    property.current_stage,
+    property.status,
+    property.description,
+    property.description_ja,
+    property.description_zh
+  ].map((item) => normalizeText(item).toLowerCase());
+
+  return source.some((item) =>
+    item.includes('賃貸中') ||
+    item.includes('出租中') ||
+    item.includes('leased') ||
+    item.includes('tenant')
+  );
+}
+
+function buildOpeningLine(property = {}, context = {}) {
+  const title = context.title || property.title || '這間物件';
+  if (context.country === 'jp' && context.listing_mode === 'rental') {
+    return `${title} 這類離車站不遠、又有租賃條件可參考的日本小宅，通常很容易進入買方的比較名單。`;
+  }
+  if (context.country === 'jp') {
+    return `${title} 這類日本住宅，通常會先看地段條件、持有節奏與長期配置價值。`;
+  }
+  return `${title} 這類型物件，通常會先從生活機能、空間感與自住舒適度開始吸引買方。`;
+}
+
+function buildPositioningLine(context = {}) {
+  const transit = normalizeText(context.transit) || '交通資訊仍在補充中';
+  if (context.country === 'jp' && context.listing_mode === 'rental') {
+    if (transit === '交通資訊仍在補充中') {
+      return '交通資訊仍在補充中，現階段先用出租定位與長期持有節奏來看會比較有方向。';
+    }
+    return `從${transit}來看，交通便利性與出租定位都已有初步討論空間。`;
+  }
+  if (context.country === 'jp') {
+    if (transit === '交通資訊仍在補充中') {
+      return '交通資訊仍在補充中，適合先從區位條件與持有規劃切入。';
+    }
+    return `從${transit}來看，區位條件已具備基本吸引力，適合從持有規劃切入。`;
+  }
+  if (transit === '交通資訊仍在補充中') {
+    return '交通資訊仍在補充中，生活圈與自住便利性仍可先作為主要溝通重點。';
+  }
+  return `從${transit}來看，生活圈與自住便利性會是主要溝通重點。`;
+}
+
+function buildPropertyConditionLine(property = {}, context = {}) {
+  const parts = [];
+
+  if (context.listing_mode === 'rental') {
+    parts.push(context.is_occupied_rental ? '目前為賃貸中' : '目前可先從租賃條件切入');
+  }
+
+  if (context.rent_jpy != null) {
+    parts.push(`月租金約 ${formatJpy(context.rent_jpy)}`);
+  } else if (context.price_jpy != null) {
+    parts.push(`總價約 ${formatJpy(context.price_jpy)}`);
+  }
+
+  if (property.layout) parts.push(`格局為 ${property.layout}`);
+  if (normalizeNullableNumber(property.area_sqm) != null) {
+    parts.push(`專有面積約 ${normalizeNullableNumber(property.area_sqm)} 平方公尺`);
+  }
+  if (normalizeNullableNumber(property.building_age) != null) {
+    parts.push(`屋齡約 ${normalizeNullableNumber(property.building_age)} 年`);
+  }
+
+  if (parts.length === 0) {
+    return context.country === 'jp'
+      ? '目前先以租賃定位、屋況與持有條件做第一輪篩選。'
+      : '目前先以生活圈、屋況與使用條件做第一輪篩選。';
+  }
+
+  return `${parts.join('，')}。`;
+}
+
+function buildAssessmentLine(context = {}) {
+  if (context.price_jpy != null && context.rent_jpy != null && context.gross_yield_pct != null) {
+    return `${context.yield_line} 實際仍要連同管理、修繕與持有成本一起看，判斷才會更完整。`;
+  }
+
+  if (context.listing_mode === 'rental' && context.rent_jpy != null) {
+    return `現階段先以月租金約 ${formatJpy(context.rent_jpy)}、${context.transit}、屋況與持有條件做初步評估；等總價與完整持有成本補齊後，再做投報試算會更準。`;
+  }
+
+  return `目前可先從 ${context.transit}、${context.lifestyle} 與屋況條件做初步判斷；價格與交易條件補齊後，再進一步比較會更穩健。`;
+}
+
+function buildComplianceAndCtaLine(narrative = {}, promptContext = {}) {
+  const cta = normalizeText(promptContext.cta) || narrative.lines.cta;
+  return `${narrative.lines.compliance} ${cta}`.trim();
+}
+
 function buildNarrativeTransform(property = {}, analysis = {}) {
   const legacyAnalysis = normalizeLegacyAnalysis(analysis);
   const enrichedAnalysis = normalizeEnrichedAnalysis(analysis);
   const country = detectCountry(property);
   const listingMode = detectListingMode(property);
+  const isOccupiedRental = detectRentalOccupancy(property);
   const priceJpy = enrichedAnalysis.price_jpy ?? extractPriceJpy(property);
   const rentJpy = enrichedAnalysis.monthly_rent_jpy ?? extractRentJpy(property);
   const yieldNarrative = buildYieldNarrative(priceJpy, rentJpy, enrichedAnalysis.gross_yield_pct);
@@ -380,13 +505,24 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
     enrichedAnalysis.property_strengths[0],
     enrichedAnalysis.investment_pros[0],
     legacyAnalysis.highlights[0]
-  ) || (country === 'jp'
-    ? '屬於都心小宅型產品，重點在出租定位與持有節奏。'
-    : '重點在生活圈、空間感與自住使用情境。');
-  const riskLine = pickFirstText(
-    enrichedAnalysis.investment_risks[0],
-    legacyAnalysis.risk_notes[0]
-  ) || '實際價格、屋況與交易條件仍需以最新資料確認。';
+  );
+  const normalizedValuePoint = valuePoint && !isWeakSalesLine(valuePoint)
+    ? valuePoint
+    : '';
+  const riskCandidates = [
+    ...enrichedAnalysis.investment_risks,
+    ...legacyAnalysis.risk_notes
+  ];
+  const riskLine = riskCandidates.find((line) => {
+    const normalized = normalizeText(line);
+    if (!normalized) return false;
+    if (listingMode === 'rental' && priceJpy == null && /初步評估|投報試算|月租金約/.test(normalized)) {
+      return false;
+    }
+    return true;
+  }) || (listingMode === 'rental' && priceJpy == null
+    ? '總價與完整持有成本仍待補齊，正式投資判斷前還要再核對。'
+    : '實際價格、屋況與交易條件仍需以最新資料確認。');
   const cta = pickFirstText(
     enrichedAnalysis.marketing_line[0],
     legacyAnalysis.communication_tips[0]
@@ -396,16 +532,41 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
     legacyAnalysis.compliance_notes[0]
   ) || '價格與交易條件仍以最新資料為準。';
 
-  const openingLine = country === 'jp'
-    ? `${title} 這類型物件，核心是日本住宅投資判斷與長期持有規劃。`
-    : `${title} 這類型物件，核心會放在生活機能、自住情境與空間使用感。`;
-
+  const openingLine = buildOpeningLine(property, {
+    title,
+    country,
+    listing_mode: listingMode
+  });
   const positioningLine = country === 'jp'
     ? `屬於${listingMode === 'rental' ? '都心收租' : '日本住宅'}導向產品，主要適合 ${targetBuyer}。`
     : `整體定位偏向生活導向產品，主要適合 ${targetBuyer}。`;
+  const positioningNaturalLine = buildPositioningLine({
+    country,
+    listing_mode: listingMode,
+    transit: locationNarrative.transit_line
+  });
+  const conditionsLine = buildPropertyConditionLine(property, {
+    country,
+    listing_mode: listingMode,
+    is_occupied_rental: isOccupiedRental,
+    price_jpy: priceJpy,
+    rent_jpy: rentJpy
+  });
+  const assessmentLine = buildAssessmentLine({
+    country,
+    listing_mode: listingMode,
+    transit: locationNarrative.transit_line,
+    lifestyle: locationNarrative.lifestyle_line,
+    price_jpy: priceJpy,
+    rent_jpy: rentJpy,
+    gross_yield_pct: yieldNarrative.gross_yield_pct,
+    yield_line: yieldNarrative.line
+  });
 
   return {
     country,
+    listing_mode: listingMode,
+    is_occupied_rental: isOccupiedRental,
     title,
     price_jpy: priceJpy,
     rent_jpy: rentJpy,
@@ -421,10 +582,15 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
     lines: {
       opening: openingLine,
       positioning: positioningLine,
-      value: valuePoint,
+      positioning_natural: positioningNaturalLine,
+      value: normalizedValuePoint || (country === 'jp'
+        ? '這類小坪數產品通常會以穩定出租與持有彈性作為主要賣點。'
+        : '重點會放在生活圈、空間感與自住使用情境。'),
       transit: locationNarrative.transit_line,
       lifestyle: locationNarrative.lifestyle_line,
       yield: yieldNarrative.line,
+      conditions: conditionsLine,
+      assessment: assessmentLine,
       risk: riskLine,
       compliance: complianceLine,
       cta
@@ -456,34 +622,31 @@ function buildCopyMeta({ analysis = {}, promptContext = {}, usage = {} } = {}) {
 }
 
 function buildFbNarrativeCopy(narrative, promptContext = {}) {
-  const cta = normalizeText(promptContext.cta) || narrative.lines.cta;
+  const complianceAndCta = buildComplianceAndCtaLine(narrative, promptContext);
   return [
     narrative.lines.opening,
-    [
-      narrative.lines.positioning,
-      narrative.lines.value,
-      narrative.lines.transit,
-      narrative.lines.lifestyle
-    ].join(' '),
-    narrative.lines.yield,
-    `風險提醒：${narrative.lines.risk}`,
-    `${narrative.lines.compliance}\n${cta}`
+    `${narrative.lines.positioning_natural} ${narrative.lines.value}`.trim(),
+    narrative.lines.conditions,
+    `${narrative.lines.assessment} ${narrative.lines.risk}`.trim(),
+    complianceAndCta
   ].join('\n\n');
 }
 
 function buildIgNarrativeCopy(narrative, promptContext = {}) {
-  const cta = normalizeText(promptContext.cta) || narrative.lines.cta || '想看完整資料，直接私訊我。';
-  const bullets = [
-    narrative.lines.positioning,
+  const cta = normalizeText(promptContext.cta) || '想看完整資料，直接私訊我。';
+  const heading = narrative.country === 'jp'
+    ? `${narrative.title}｜日本收租型物件`
+    : `${narrative.title}｜生活圈精選`;
+  const bullets = uniqueTextLines([
+    narrative.lines.positioning_natural,
+    narrative.lines.conditions,
     narrative.lines.value,
-    narrative.lines.transit,
-    narrative.lines.lifestyle,
-    narrative.lines.yield,
+    narrative.lines.assessment,
     `提醒：${narrative.lines.risk}`
-  ].slice(0, 5);
+  ]).slice(0, 5);
 
   return [
-    narrative.title,
+    heading,
     ...bullets.map((item) => `• ${item}`),
     cta,
     narrative.country === 'jp'
@@ -493,13 +656,12 @@ function buildIgNarrativeCopy(narrative, promptContext = {}) {
 }
 
 function buildLineNarrativeCopy(narrative, promptContext = {}) {
-  const cta = normalizeText(promptContext.cta) || narrative.lines.cta || '如果你要，我可以直接整理完整資料和比較表給你。';
+  const cta = normalizeText(promptContext.cta) || '如果你要，我可以直接整理完整資料和比較表給你。';
   return [
-    `${narrative.title} 我先幫你抓重點。`,
-    narrative.lines.positioning,
-    narrative.lines.value,
-    narrative.lines.yield,
-    `提醒你先注意：${narrative.lines.risk}`,
+    `${narrative.title} 這間我會先建議你放進比較清單。`,
+    `${narrative.lines.positioning_natural} ${narrative.lines.conditions}`.trim(),
+    narrative.lines.assessment,
+    `先提醒你：${narrative.lines.risk}`,
     cta
   ].join('\n');
 }
@@ -548,8 +710,9 @@ function fallbackAssistantAnalysis(property) {
   const rentJpy = extractRentJpy(property);
   const yieldNarrative = buildYieldNarrative(priceJpy, rentJpy);
   const locationNarrative = buildLocationNarrative(property, {});
+  const occupiedRental = detectRentalOccupancy(property);
   const priceLine = priceJpy != null
-    ? `總價約 ¥${priceJpy.toLocaleString()}`
+    ? `總價約 ${formatJpy(priceJpy)}`
     : property.price
       ? `${property.price} ${property.currency || (country === 'jp' ? 'JPY' : 'TWD')}`
       : '價格待確認';
@@ -557,9 +720,9 @@ function fallbackAssistantAnalysis(property) {
   return {
     result: {
       highlights: [
-        `${location}可作為主要溝通切入點。`,
+        country === 'jp' ? '可先從車站距離與出租定位切入。' : `${location}的生活圈條件可先作為溝通重點。`,
         listingMode === 'rental'
-          ? `目前可先用月租條件切入，租賃定位會比單看總價更有說服力。`
+          ? `目前可先用月租金條件切入，租賃定位會比單看總價更有說服力。`
           : `${priceLine}，適合搭配同區行情與長期持有角度溝通。`,
         locationNarrative.is_transit_missing ? '交通資訊仍在補充中。' : `可強調 ${locationNarrative.transit_line} 的移動便利性。`
       ],
@@ -574,7 +737,9 @@ function fallbackAssistantAnalysis(property) {
         country === 'jp' ? '可再搭配同區租賃需求與持有節奏比較。' : '可再搭配同區生活圈與替代物件比較。'
       ],
       risk_notes: [
-        yieldNarrative.line,
+        listingMode === 'rental' && priceJpy == null && rentJpy != null
+          ? `目前先以月租金約 ${formatJpy(rentJpy)}、車站距離、${occupiedRental ? '現況出租' : '租賃定位'}與持有條件做初步評估。`
+          : yieldNarrative.line,
         '實際屋況、權狀、貸款條件與交易成本仍需逐項確認。',
         '市場行情會變動，不能以單一物件資訊承諾投資報酬。'
       ],
