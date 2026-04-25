@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { respondError, respondOk } from '../lib/http.js';
-import { analyzePropertyForAssistant, generateAssistantCopy } from '../services/ai.js';
+import {
+  analyzePropertyForAssistant,
+  generateAssistantCopy
+} from '../services/ai.js';
 import {
   applyDemoReadScope,
   applyDemoWriteDefaults,
@@ -30,9 +33,13 @@ const PROPERTY_SNAPSHOT_SELECT = [
   'prefecture',
   'city',
   'district',
+  'address_full_ja',
   'address_ja',
   'address_zh',
   'address_en',
+  'address',
+  'latitude',
+  'longitude',
   'purpose',
   'property_type',
   'price',
@@ -172,6 +179,26 @@ function toSnapshot(property) {
     snapshot_at: new Date().toISOString(),
     source: 'properties',
     property
+  };
+}
+
+function buildMarketContext(property = {}) {
+  const country = String(property.country || 'jp').toLowerCase() === 'tw' ? 'tw' : 'jp';
+  const purpose = String(property.purpose || '').toLowerCase();
+  const layout = String(property.layout || '').toLowerCase();
+
+  let marketProfile = 'mixed';
+  if (country === 'jp') {
+    marketProfile = 'investment';
+  } else if (purpose.includes('自住') || purpose.includes('owner')) {
+    marketProfile = 'owner_occupier';
+  } else if (layout.includes('1r') || layout.includes('1k') || layout.includes('套房')) {
+    marketProfile = 'investment';
+  }
+
+  return {
+    country,
+    market_profile: marketProfile
   };
 }
 
@@ -519,6 +546,17 @@ router.post('/copy-generations', async (req, res) => {
       promptContext
     });
     const usage = normalizeUsage(aiCopy.usage);
+    const generationMeta = {
+      provider: aiCopy.meta?.provider ?? usage.provider,
+      model: aiCopy.meta?.model ?? usage.model,
+      is_fallback: Boolean(aiCopy.meta?.is_fallback ?? (usage.provider === 'fallback' || usage.model === 'local-fallback')),
+      analysis_version: analysisResult.analysis?.analysis_version ?? aiCopy.meta?.analysis_version ?? null,
+      data_sources: aiCopy.meta?.data_sources ?? {
+        property: true,
+        analysis: Boolean(analysisResult.analysis?.result_json),
+        prompt_context: Object.keys(promptContext || {}).length > 0
+      }
+    };
     const copyPayload = applyDemoWriteDefaults({
       property_id: propertyId,
       analysis_id: analysisResult.analysis?.id ?? null,
@@ -581,10 +619,21 @@ router.post('/copy-generations', async (req, res) => {
       });
     }
 
-    return respondOk(res, { ...copy, versions: [version] }, 201, {
+    return respondOk(res, {
+      ...copy,
+      is_fallback: generationMeta.is_fallback,
+      analysis_version: generationMeta.analysis_version,
+      data_sources: generationMeta.data_sources,
+      versions: [version]
+    }, 201, {
       reused: false,
       charged_units: UNIT_COST,
-      quota: quotaResult.quota
+      quota: quotaResult.quota,
+      provider: generationMeta.provider,
+      model: generationMeta.model,
+      is_fallback: generationMeta.is_fallback,
+      analysis_version: generationMeta.analysis_version,
+      data_sources: generationMeta.data_sources
     });
   } catch (error) {
     if (!copy) await refundQuota(req, quotaResult.periodMonth);
@@ -757,7 +806,12 @@ async function createAnalysis(req, res, property) {
   let insertedAnalysis = null;
 
   try {
-    const aiAnalysis = await analyzePropertyForAssistant(property);
+    const aiAnalysis = await analyzePropertyForAssistant({
+      property,
+      locationEnrichment: null,
+      marketContext: buildMarketContext(property),
+      analysisMode: 'standard_analysis'
+    });
     const usage = normalizeUsage(aiAnalysis.usage);
     const nextVersion = await getNextAnalysisVersion(req, property.id);
 
