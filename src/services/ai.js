@@ -137,6 +137,25 @@ function normalizeComplianceFlags(value) {
     .filter(Boolean);
 }
 
+function normalizeText(value, fallback = '') {
+  if (value == null) return fallback;
+  return String(value).trim();
+}
+
+function pickFirstText(...values) {
+  for (const value of values) {
+    const normalized = normalizeText(value);
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
+function normalizeNullableNumber(value) {
+  if (value == null || value === '') return null;
+  const number = Number(String(value).replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(number) ? number : null;
+}
+
 function normalizeAnalysisShape(parsed) {
   return {
     highlights: normalizeArray(parsed.highlights),
@@ -155,6 +174,334 @@ function normalizeCopyShape(parsed) {
     compliance_flags: normalizeComplianceFlags(parsed.compliance_flags || parsed.compliance_flags_json),
     risk_score: normalizeRiskScore(parsed.risk_score)
   };
+}
+
+function normalizeLegacyAnalysis(analysis = {}) {
+  return {
+    highlights: normalizeArray(analysis.highlights),
+    target_buyers: normalizeArray(analysis.target_buyers),
+    locality_angles: normalizeArray(analysis.locality_angles),
+    risk_notes: normalizeArray(analysis.risk_notes),
+    communication_tips: normalizeArray(analysis.communication_tips),
+    compliance_notes: normalizeArray(analysis.compliance_notes),
+    suggested_marketing_angles: normalizeArray(analysis.suggested_marketing_angles)
+  };
+}
+
+function normalizeEnrichedAnalysis(analysis = {}) {
+  const propertyPositioning = analysis?.property_positioning && typeof analysis.property_positioning === 'object'
+    ? analysis.property_positioning
+    : {};
+  const locationAnalysis = analysis?.location_analysis && typeof analysis.location_analysis === 'object'
+    ? analysis.location_analysis
+    : {};
+  const investmentAnalysis = analysis?.investment_analysis && typeof analysis.investment_analysis === 'object'
+    ? analysis.investment_analysis
+    : {};
+  const propertyStrengths = analysis?.property_strengths && typeof analysis.property_strengths === 'object'
+    ? analysis.property_strengths
+    : {};
+  const marketingAngles = analysis?.marketing_angles && typeof analysis.marketing_angles === 'object'
+    ? analysis.marketing_angles
+    : {};
+  const buyerPersonas = analysis?.buyer_personas && typeof analysis.buyer_personas === 'object'
+    ? analysis.buyer_personas
+    : {};
+  const complianceNotes = analysis?.compliance_notes && typeof analysis.compliance_notes === 'object'
+    ? analysis.compliance_notes
+    : {};
+  const transit = locationAnalysis?.transit && typeof locationAnalysis.transit === 'object'
+    ? locationAnalysis.transit
+    : {};
+
+  return {
+    positioning_one_liner: normalizeText(propertyPositioning.one_liner),
+    fit_types: normalizeArray(propertyPositioning.fit_types),
+    transit_station: normalizeText(transit.nearest_station),
+    transit_walk_minutes: normalizeNullableNumber(transit.walk_minutes),
+    transit_lines: normalizeArray(transit.lines?.map?.((line) => {
+      if (typeof line === 'string') return line;
+      if (line && typeof line === 'object') return line.name;
+      return null;
+    })),
+    lifestyle_summary: normalizeText(locationAnalysis.lifestyle_summary),
+    poi_200m_highlights: normalizeArray(locationAnalysis.poi_200m_highlights),
+    poi_500m_highlights: normalizeArray(locationAnalysis.poi_500m_highlights),
+    uncertain_fields: normalizeArray(locationAnalysis.uncertain_fields),
+    price_jpy: normalizeNullableNumber(investmentAnalysis.price_jpy),
+    monthly_rent_jpy: normalizeNullableNumber(investmentAnalysis.monthly_rent_jpy),
+    gross_yield_pct: normalizeNullableNumber(investmentAnalysis.gross_yield_pct),
+    investment_pros: normalizeArray(investmentAnalysis.investment_pros),
+    investment_risks: normalizeArray(investmentAnalysis.investment_risks),
+    calculation_notes: normalizeArray(investmentAnalysis.calculation_notes),
+    owner_occupier_fit: normalizeText(investmentAnalysis.owner_occupier_fit),
+    property_strengths: Object.values(propertyStrengths).flatMap((value) => {
+      if (Array.isArray(value)) return normalizeArray(value);
+      const normalized = normalizeText(value);
+      return normalized ? [normalized] : [];
+    }),
+    must_include: normalizeArray(complianceNotes.must_include),
+    ocr_uncertain_fields: normalizeArray(complianceNotes.ocr_uncertain_fields),
+    forbidden_claims: normalizeArray(complianceNotes.forbidden_claims),
+    buyer_personas: Object.values(buyerPersonas).flatMap((value) => normalizeArray(value)),
+    marketing_fb: normalizeArray(marketingAngles.fb_long_form),
+    marketing_ig: normalizeArray(marketingAngles.ig_short_highlights),
+    marketing_line: normalizeArray(marketingAngles.line_dm)
+  };
+}
+
+function detectCountry(property = {}) {
+  const explicitCountry = normalizeText(property.country).toLowerCase();
+  if (explicitCountry === 'jp' || normalizeText(property.title_ja) || normalizeText(property.address_ja)) return 'jp';
+  if (explicitCountry === 'tw') return 'tw';
+  return 'jp';
+}
+
+function detectListingMode(property = {}) {
+  const source = [
+    property.current_stage,
+    property.purpose,
+    property.status,
+    property.source_type,
+    property.description,
+    property.description_ja,
+    property.description_zh
+  ].map((item) => normalizeText(item).toLowerCase());
+
+  if (source.some((item) => item.includes('rent') || item.includes('lease') || item.includes('賃貸') || item.includes('出租'))) {
+    return 'rental';
+  }
+  return 'sale';
+}
+
+function extractRentJpy(property = {}) {
+  const directRent = [
+    property.rent_jpy,
+    property.monthly_rent_jpy,
+    property.monthly_rent,
+    property.rent
+  ].map((value) => normalizeNullableNumber(value)).find((value) => value != null);
+  if (directRent != null) return directRent;
+
+  if (detectListingMode(property) === 'rental') {
+    const rentalPrice = normalizeNullableNumber(property.price);
+    if (rentalPrice != null) return rentalPrice;
+  }
+
+  const textBlob = [
+    property.description,
+    property.description_ja,
+    property.description_zh
+  ].map((value) => normalizeText(value)).filter(Boolean).join('\n');
+
+  const match = textBlob.match(/(?:家賃|月租)[^\d]{0,6}([\d,]+)/);
+  if (!match) return null;
+  return normalizeNullableNumber(match[1]);
+}
+
+function extractPriceJpy(property = {}) {
+  const directPrice = [
+    property.price_jpy,
+    property.total_price_jpy,
+    property.sale_price_jpy
+  ].map((value) => normalizeNullableNumber(value)).find((value) => value != null);
+  if (directPrice != null) return directPrice;
+
+  if (detectCountry(property) !== 'jp') return null;
+  if (detectListingMode(property) === 'rental') return null;
+
+  return normalizeNullableNumber(property.price);
+}
+
+function buildLocationNarrative(property = {}, analysis = {}) {
+  const legacy = normalizeLegacyAnalysis(analysis);
+  const enriched = normalizeEnrichedAnalysis(analysis);
+  const localityAngles = [
+    enriched.lifestyle_summary,
+    ...enriched.poi_200m_highlights,
+    ...enriched.poi_500m_highlights,
+    ...legacy.locality_angles
+  ].filter(Boolean);
+  const transitLabel = pickFirstText(
+    enriched.transit_station,
+    property.nearest_station
+  );
+  const walkMinutes = normalizeNullableNumber(
+    enriched.transit_walk_minutes ?? property.walking_minutes
+  );
+
+  return {
+    short_label: detectCountry(property) === 'jp' ? '日本物件' : '台灣物件',
+    transit_line: transitLabel
+      ? `${transitLabel}${walkMinutes != null ? `，步行約 ${walkMinutes} 分鐘` : ''}`
+      : (detectCountry(property) === 'jp' ? '交通資訊仍在補充中' : '交通資訊仍在補充中'),
+    lifestyle_line: localityAngles[0] || '周邊生活機能資料尚待補強',
+    is_transit_missing: !transitLabel,
+    is_lifestyle_missing: localityAngles.length === 0
+  };
+}
+
+function buildYieldNarrative(priceJpy, rentJpy, explicitGrossYield = null) {
+  if (priceJpy != null && rentJpy != null && priceJpy > 0) {
+    const grossYield = explicitGrossYield != null
+      ? Number(explicitGrossYield.toFixed(2))
+      : Number((((rentJpy * 12) / priceJpy) * 100).toFixed(2));
+    return {
+      gross_yield_pct: grossYield,
+      line: `若以月租約 ¥${rentJpy.toLocaleString()} 與總價搭配評估，表面投報率約 ${grossYield}% 左右。`
+    };
+  }
+
+  return {
+    gross_yield_pct: null,
+    line: '目前資料尚無法估算投報率，建議保守評估。'
+  };
+}
+
+function buildNarrativeTransform(property = {}, analysis = {}) {
+  const legacyAnalysis = normalizeLegacyAnalysis(analysis);
+  const enrichedAnalysis = normalizeEnrichedAnalysis(analysis);
+  const country = detectCountry(property);
+  const listingMode = detectListingMode(property);
+  const priceJpy = enrichedAnalysis.price_jpy ?? extractPriceJpy(property);
+  const rentJpy = enrichedAnalysis.monthly_rent_jpy ?? extractRentJpy(property);
+  const yieldNarrative = buildYieldNarrative(priceJpy, rentJpy, enrichedAnalysis.gross_yield_pct);
+  const locationNarrative = buildLocationNarrative(property, analysis);
+  const title = property.title_zh || property.title || property.title_ja || '精選物件';
+  const targetBuyer = pickFirstText(
+    enrichedAnalysis.fit_types[0],
+    enrichedAnalysis.buyer_personas[0],
+    legacyAnalysis.target_buyers[0]
+  ) || (country === 'jp'
+    ? '重視長期持有與收租規劃的買方'
+    : '重視生活機能與自住感的買方');
+  const valuePoint = pickFirstText(
+    enrichedAnalysis.positioning_one_liner,
+    enrichedAnalysis.property_strengths[0],
+    enrichedAnalysis.investment_pros[0],
+    legacyAnalysis.highlights[0]
+  ) || (country === 'jp'
+    ? '屬於都心小宅型產品，重點在出租定位與持有節奏。'
+    : '重點在生活圈、空間感與自住使用情境。');
+  const riskLine = pickFirstText(
+    enrichedAnalysis.investment_risks[0],
+    legacyAnalysis.risk_notes[0]
+  ) || '實際價格、屋況與交易條件仍需以最新資料確認。';
+  const cta = pickFirstText(
+    enrichedAnalysis.marketing_line[0],
+    legacyAnalysis.communication_tips[0]
+  ) || '想看完整資料、比較表或安排進一步討論，歡迎直接私訊。';
+  const complianceLine = pickFirstText(
+    enrichedAnalysis.must_include[0],
+    legacyAnalysis.compliance_notes[0]
+  ) || '價格與交易條件仍以最新資料為準。';
+
+  const openingLine = country === 'jp'
+    ? `${title} 這類型物件，核心是日本住宅投資判斷與長期持有規劃。`
+    : `${title} 這類型物件，核心會放在生活機能、自住情境與空間使用感。`;
+
+  const positioningLine = country === 'jp'
+    ? `屬於${listingMode === 'rental' ? '都心收租' : '日本住宅'}導向產品，主要適合 ${targetBuyer}。`
+    : `整體定位偏向生活導向產品，主要適合 ${targetBuyer}。`;
+
+  return {
+    country,
+    title,
+    price_jpy: priceJpy,
+    rent_jpy: rentJpy,
+    gross_yield_pct: yieldNarrative.gross_yield_pct,
+    data_sources: {
+      property: true,
+      legacy_analysis: Object.values(legacyAnalysis).some((value) => Array.isArray(value) && value.length > 0),
+      enriched_analysis: Object.values(enrichedAnalysis).some((value) => {
+        if (Array.isArray(value)) return value.length > 0;
+        return value != null && value !== '';
+      })
+    },
+    lines: {
+      opening: openingLine,
+      positioning: positioningLine,
+      value: valuePoint,
+      transit: locationNarrative.transit_line,
+      lifestyle: locationNarrative.lifestyle_line,
+      yield: yieldNarrative.line,
+      risk: riskLine,
+      compliance: complianceLine,
+      cta
+    }
+  };
+}
+
+function buildCopyDataSources(analysis = {}, promptContext = {}) {
+  const normalizedAnalysis = normalizeLegacyAnalysis(analysis);
+  const enrichedAnalysis = normalizeEnrichedAnalysis(analysis);
+  const hasLegacyAnalysis = Object.values(normalizedAnalysis).some((value) => Array.isArray(value) && value.length > 0);
+  const hasEnrichedAnalysis = Object.values(enrichedAnalysis).some((value) => Array.isArray(value) ? value.length > 0 : Boolean(value));
+  return {
+    property: true,
+    analysis: hasLegacyAnalysis || hasEnrichedAnalysis,
+    enriched_analysis: hasEnrichedAnalysis,
+    prompt_context: Boolean(promptContext && Object.keys(promptContext).length > 0)
+  };
+}
+
+function buildCopyMeta({ analysis = {}, promptContext = {}, usage = {} } = {}) {
+  return {
+    provider: usage.provider ?? null,
+    model: usage.model ?? null,
+    is_fallback: usage.provider === 'fallback' || usage.model === 'local-fallback',
+    analysis_version: normalizeNullableNumber(analysis.analysis_version) ?? null,
+    data_sources: buildCopyDataSources(analysis.result_json ?? analysis, promptContext)
+  };
+}
+
+function buildFbNarrativeCopy(narrative, promptContext = {}) {
+  const cta = normalizeText(promptContext.cta) || narrative.lines.cta;
+  return [
+    narrative.lines.opening,
+    [
+      narrative.lines.positioning,
+      narrative.lines.value,
+      narrative.lines.transit,
+      narrative.lines.lifestyle
+    ].join(' '),
+    narrative.lines.yield,
+    `風險提醒：${narrative.lines.risk}`,
+    `${narrative.lines.compliance}\n${cta}`
+  ].join('\n\n');
+}
+
+function buildIgNarrativeCopy(narrative, promptContext = {}) {
+  const cta = normalizeText(promptContext.cta) || narrative.lines.cta || '想看完整資料，直接私訊我。';
+  const bullets = [
+    narrative.lines.positioning,
+    narrative.lines.value,
+    narrative.lines.transit,
+    narrative.lines.lifestyle,
+    narrative.lines.yield,
+    `提醒：${narrative.lines.risk}`
+  ].slice(0, 5);
+
+  return [
+    narrative.title,
+    ...bullets.map((item) => `• ${item}`),
+    cta,
+    narrative.country === 'jp'
+      ? '#星澄地所 #日本不動產 #收租規劃 #資產配置'
+      : '#星澄地所 #台灣房地產 #生活機能 #自住規劃'
+  ].join('\n');
+}
+
+function buildLineNarrativeCopy(narrative, promptContext = {}) {
+  const cta = normalizeText(promptContext.cta) || narrative.lines.cta || '如果你要，我可以直接整理完整資料和比較表給你。';
+  return [
+    `${narrative.title} 我先幫你抓重點。`,
+    narrative.lines.positioning,
+    narrative.lines.value,
+    narrative.lines.yield,
+    `提醒你先注意：${narrative.lines.risk}`,
+    cta
+  ].join('\n');
 }
 
 function fallbackTranslate(input) {
@@ -194,45 +541,57 @@ function fallbackGeneratePost(property) {
 }
 
 function fallbackAssistantAnalysis(property) {
-  const location = [property.city, property.district].filter(Boolean).join('') || '台灣';
-  const price = property.price ? `${property.price} ${property.currency || 'TWD'}` : '價格待確認';
+  const country = detectCountry(property);
+  const location = [property.city, property.district].filter(Boolean).join('') || (country === 'jp' ? '日本物件' : '所在地待確認');
+  const listingMode = detectListingMode(property);
+  const priceJpy = extractPriceJpy(property);
+  const rentJpy = extractRentJpy(property);
+  const yieldNarrative = buildYieldNarrative(priceJpy, rentJpy);
+  const locationNarrative = buildLocationNarrative(property, {});
+  const priceLine = priceJpy != null
+    ? `總價約 ¥${priceJpy.toLocaleString()}`
+    : property.price
+      ? `${property.price} ${property.currency || (country === 'jp' ? 'JPY' : 'TWD')}`
+      : '價格待確認';
 
   return {
     result: {
       highlights: [
-        `${location}區位可作為主要溝通切入點。`,
-        `總價或租金條件為 ${price}，適合搭配周邊行情比較。`,
-        property.nearest_station ? `可強調鄰近 ${property.nearest_station} 的生活便利性。` : '可補充交通與生活機能資料提高說服力。'
+        `${location}可作為主要溝通切入點。`,
+        listingMode === 'rental'
+          ? `目前可先用月租條件切入，租賃定位會比單看總價更有說服力。`
+          : `${priceLine}，適合搭配同區行情與長期持有角度溝通。`,
+        locationNarrative.is_transit_missing ? '交通資訊仍在補充中。' : `可強調 ${locationNarrative.transit_line} 的移動便利性。`
       ],
       target_buyers: [
-        '重視區位與生活機能的自住客',
-        '尋找穩定標的的資產配置型買方',
-        '需要明確總價帶與付款規劃的首購或換屋客'
+        country === 'jp' ? '重視長期持有與收租規劃的買方' : '重視區位與生活機能的自住客',
+        country === 'jp' ? '想布局海外不動產的資產配置型買方' : '需要明確總價帶與付款規劃的首購或換屋客',
+        country === 'jp' ? '重視穩定租客輪替與都心配置的投資客' : '兼顧通勤與生活圈的換屋客'
       ],
       locality_angles: [
-        '交通節點、商圈、學區與日常採買便利性',
-        '同區供給量與替代物件比較',
-        '未來生活圈發展與持有便利性'
+        locationNarrative.transit_line,
+        locationNarrative.lifestyle_line,
+        country === 'jp' ? '可再搭配同區租賃需求與持有節奏比較。' : '可再搭配同區生活圈與替代物件比較。'
       ],
       risk_notes: [
+        yieldNarrative.line,
         '實際屋況、權狀、貸款條件與交易成本仍需逐項確認。',
-        '市場行情會變動，不能以單一物件資訊承諾投資報酬。',
-        '若資料欄位不足，對外文案應避免使用絕對化或保證式描述。'
+        '市場行情會變動，不能以單一物件資訊承諾投資報酬。'
       ],
       communication_tips: [
-        '先用生活情境建立想像，再補價格與坪數等硬資訊。',
+        country === 'jp' ? '先用投資定位與收租邏輯切入，再補價格與持有條件。' : '先用生活情境建立想像，再補價格與坪數等硬資訊。',
         '主動揭露待確認事項，降低後續期待落差。',
-        '引導客戶預約看屋或索取完整比較表。'
+        '引導客戶索取完整比較表、租賃試算或安排進一步討論。'
       ],
       compliance_notes: [
         '避免宣稱保證增值、保證出租或穩賺不賠。',
         '價格、坪數、屋齡與交通時間需以最新資料核對。',
-        '若使用投資語氣，需加上風險與自行評估提醒。'
+        country === 'jp' ? '周邊設施與距離以最新地圖資料為準。' : '若使用投資語氣，需加上風險與自行評估提醒。'
       ],
       suggested_marketing_angles: [
-        '區位生活感',
-        '總價帶清楚',
-        '看屋決策效率',
+        country === 'jp' ? '投資定位清楚' : '區位生活感',
+        country === 'jp' ? '長期持有規劃' : '總價帶清楚',
+        country === 'jp' ? '收租評估角度' : '看屋決策效率',
         '同區比較'
       ]
     },
@@ -243,23 +602,30 @@ function fallbackAssistantAnalysis(property) {
   };
 }
 
-function fallbackAssistantCopy(property, channel) {
-  const title = property.title_zh || property.title || '精選物件';
-  const location = [property.city, property.district].filter(Boolean).join('') || '台灣';
+function fallbackAssistantCopy(property, analysis, channel, promptContext = {}) {
+  const narrative = buildNarrativeTransform(property, analysis);
   const base = {
-    fb: `【${title}】\n${location}精選物件，適合想兼顧生活機能與資產配置的你。\n\n價格、屋況與交易條件仍以最新資料確認為準。想看完整資訊，歡迎私訊星澄地所。`,
-    ig: `${title}\n${location}生活圈精選物件\n\n看重區位、機能與總價帶的朋友，可以把這間列入比較清單。\n\n#星澄地所 #台灣房地產 #精選物件`,
-    line: `推薦你看看這間：${title}。位置在${location}，可以從生活機能、總價帶和屋況一起評估。想看完整資料我再傳給你。`
+    fb: buildFbNarrativeCopy(narrative, promptContext),
+    ig: buildIgNarrativeCopy(narrative, promptContext),
+    line: buildLineNarrativeCopy(narrative, promptContext)
   };
+  const usage = fallbackUsage();
 
   return {
     result: {
       text: base[channel] || base.fb,
-      compliance_flags: [],
-      risk_score: 25
+      compliance_flags: normalizeComplianceFlags([
+        {
+          code: 'safe_ai_lite_mode',
+          severity: 'info',
+          message: 'Copy generated in Safe AI Lite Mode from property and analysis summary.'
+        }
+      ]),
+      risk_score: narrative.gross_yield_pct == null ? 35 : 20
     },
     tokensUsed: 0,
-    usage: fallbackUsage()
+    usage,
+    meta: buildCopyMeta({ analysis, promptContext, usage })
   };
 }
 
@@ -332,8 +698,9 @@ export async function analyzePropertyForAssistant(property) {
 }
 
 export async function generateAssistantCopy({ property, analysis = null, channel, promptContext = {} }) {
+  const narrative = buildNarrativeTransform(property, analysis || {});
   if (!OPENAI_API_KEY) {
-    return fallbackAssistantCopy(property, channel);
+    return fallbackAssistantCopy(property, analysis || {}, channel, promptContext);
   }
 
   const channelLabel = {
@@ -343,24 +710,36 @@ export async function generateAssistantCopy({ property, analysis = null, channel
   }[channel] || channel;
 
   const systemPrompt = [
-    '你是星澄地所台灣房地產文案助理。',
+    '你是星澄地所的業務總監級文案助理，不是分析師，不是研究員。',
     `請為 ${channelLabel} 產生繁體中文物件文案，輸出 JSON。`,
-    '文案需可讓業務後續人工編輯，避免誇大不實、保證收益或未查證的絕對說法。',
+    '文案只可輸出對客結果，不可輸出分析過程、欄位名稱、技術語言、snake_case key。',
+    'AI 是業務，不是研究員。語氣要能賣、能解釋、能收斂風險、能引導成交。',
+    '每一段至少要包含價值、判斷、或下一步。',
+    '日本物件重點是投報率、租客類型、都心/郊區、長期持有；台灣物件重點是生活機能、學區、自住感、空間感。',
+    '若沒有 price_jpy，不得談投報率；若沒有完整地點資料，改寫成自然語句，例如交通資訊仍在補充中、周邊生活機能資料尚待補強。',
+    '禁止輸出 raw key：poi_*、transit.*、uncertain、analysis、snake_case 欄位名。',
+    'FB 結構：開頭定位、核心價值、風險說明、行動引導。',
+    'IG 結構：短標題、3到5個重點 bullet、CTA、Hashtag。',
+    'LINE 結構：快速介紹、核心判斷、簡短風險提醒、互動引導。',
     'JSON keys 必須是：text, compliance_flags, risk_score。',
     'compliance_flags 是陣列；risk_score 是 0 到 100。'
   ].join('\n');
 
   const userPrompt = `輸入資料：\n${JSON.stringify({
     channel,
-    property,
-    analysis,
-    prompt_context: promptContext
+    narrative,
+    prompt_context: promptContext,
+    rules: {
+      safe_ai_lite_mode: false,
+      no_raw_keys: true
+    }
   }, null, 2)}`;
   const { parsed, tokensUsed, usage } = await callOpenAI(systemPrompt, userPrompt);
 
   return {
     result: normalizeCopyShape(parsed),
     tokensUsed,
-    usage
+    usage,
+    meta: buildCopyMeta({ analysis, promptContext, usage })
   };
 }

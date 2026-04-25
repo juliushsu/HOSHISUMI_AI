@@ -519,6 +519,17 @@ router.post('/copy-generations', async (req, res) => {
       promptContext
     });
     const usage = normalizeUsage(aiCopy.usage);
+    const responseMeta = {
+      provider: aiCopy.meta?.provider ?? usage.provider,
+      model: aiCopy.meta?.model ?? usage.model,
+      is_fallback: Boolean(aiCopy.meta?.is_fallback ?? (usage.provider === 'fallback' || usage.model === 'local-fallback')),
+      analysis_version: analysisResult.analysis?.analysis_version ?? aiCopy.meta?.analysis_version ?? null,
+      data_sources: aiCopy.meta?.data_sources ?? {
+        property: true,
+        analysis: Boolean(analysisResult.analysis?.result_json),
+        prompt_context: Object.keys(promptContext || {}).length > 0
+      }
+    };
     const copyPayload = applyDemoWriteDefaults({
       property_id: propertyId,
       analysis_id: analysisResult.analysis?.id ?? null,
@@ -581,10 +592,21 @@ router.post('/copy-generations', async (req, res) => {
       });
     }
 
-    return respondOk(res, { ...copy, versions: [version] }, 201, {
+    return respondOk(res, {
+      ...copy,
+      is_fallback: responseMeta.is_fallback,
+      analysis_version: responseMeta.analysis_version,
+      data_sources: responseMeta.data_sources,
+      versions: [version]
+    }, 201, {
       reused: false,
       charged_units: UNIT_COST,
-      quota: quotaResult.quota
+      quota: quotaResult.quota,
+      provider: responseMeta.provider,
+      model: responseMeta.model,
+      is_fallback: responseMeta.is_fallback,
+      analysis_version: responseMeta.analysis_version,
+      data_sources: responseMeta.data_sources
     });
   } catch (error) {
     if (!copy) await refundQuota(req, quotaResult.periodMonth);
