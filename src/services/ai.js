@@ -363,7 +363,8 @@ function extractBuiltYear(property = {}) {
     property.built_year,
     property.construction_year,
     property.year_built,
-    property.completion_year
+    property.completion_year,
+    property.building_age
   ].map((value) => normalizeNullableNumber(value)).find((value) => value != null) ?? null;
 }
 
@@ -443,6 +444,9 @@ function sanitizeCustomerFacingCopy(text, fallbackText = '') {
     .replace(/資料待補。?/g, '歡迎私訊，我們可以協助補充查詢。')
     .replace(/無法驗證/g, '可再協助查核')
     .replace(/保守評估/g, '先從已知條件開始比較')
+    .replace(/日本物件可作為主要溝通切入點。?/g, '對想布局日本不動產的買方來說，方向很清楚。')
+    .replace(/可先從車站距離與出租定位切入。?/g, '車站距離與出租定位都很有吸引力。')
+    .replace(/目前可先用月租(?:金)?條件切入[^。！？\n]*。?/g, '月租表現清楚，拿來和同區物件比較也很直覺。')
     .replace(/現在先看/g, '目前可以先從')
     .replace(/\n{3,}/g, '\n\n');
 
