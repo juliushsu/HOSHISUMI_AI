@@ -395,6 +395,13 @@ function buildCustomerYieldLine(narrative) {
   return '若您想進一步比較，我們可以協助整理同區物件、持有成本與交易條件。';
 }
 
+function buildCustomerValueLine(narrative) {
+  if (narrative.country === 'jp') {
+    return '離車站不遠、又有出租中的條件，對想找日本小宅收租的買方來說，方向很清楚。';
+  }
+  return '生活機能、通勤便利性與空間使用感都能一起評估，對自住買方會更有感。';
+}
+
 function buildCustomerRiskLine() {
   return '實際屋況、權狀、貸款條件與交易成本，我們會協助逐項確認，讓評估更安心。';
 }
@@ -591,7 +598,7 @@ function buildFbNarrativeCopy(narrative, promptContext = {}) {
     [
       narrative.facts.audience,
       '這種可以先放進比較。',
-      narrative.lines.value
+      buildCustomerValueLine(narrative)
     ].join(' ')
   );
   const facts = cleanSentence(
