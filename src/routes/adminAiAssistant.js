@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { respondError, respondOk } from '../lib/http.js';
 import { analyzePropertyForAssistant, generateAssistantCopy } from '../services/ai.js';
+import { DEFAULT_MONTHLY_UNITS, currentQuotaPeriodMonth, fetchAiQuotaSnapshot } from '../services/aiQuota.js';
 import {
   applyDemoReadScope,
   applyDemoWriteDefaults,
@@ -10,7 +11,6 @@ import {
 const ALLOWED_ROLES = new Set(['owner', 'super_admin', 'manager', 'store_manager', 'store_editor']);
 const CHANNELS = new Set(['fb', 'ig', 'line']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const DEFAULT_MONTHLY_UNITS = 100;
 const UNIT_COST = 1;
 
 const PROPERTY_SNAPSHOT_SELECT = [
@@ -133,12 +133,6 @@ function isUuid(value) {
   return typeof value === 'string' && UUID_RE.test(value);
 }
 
-function currentPeriodMonth(now = new Date()) {
-  const year = now.getUTCFullYear();
-  const month = String(now.getUTCMonth() + 1).padStart(2, '0');
-  return `${year}-${month}-01`;
-}
-
 function normalizeOptionalObject(value, fallback = {}) {
   if (value === undefined || value === null) return fallback;
   return isPlainObject(value) ? value : undefined;
@@ -172,23 +166,6 @@ function toSnapshot(property) {
     snapshot_at: new Date().toISOString(),
     source: 'properties',
     property
-  };
-}
-
-function quotaDto(quota, eventRows = []) {
-  const usedFromEvents = eventRows.reduce((sum, row) => sum + Number(row.units || 0), 0);
-  const estimatedCostUsd = eventRows.reduce((sum, row) => sum + Number(row.estimated_cost_usd || 0), 0);
-  const monthlyLimit = Number(quota?.monthly_unit_limit ?? DEFAULT_MONTHLY_UNITS);
-  const usedUnits = Number(quota?.used_units ?? usedFromEvents);
-
-  return {
-    period_month: quota?.period_month ?? currentPeriodMonth(),
-    monthly_unit_limit: monthlyLimit,
-    used_units: usedUnits,
-    remaining_units: Math.max(monthlyLimit - usedUnits, 0),
-    reserved_units: Number(quota?.reserved_units ?? 0),
-    reset_at: quota?.reset_at ?? null,
-    estimated_cost_usd: estimatedCostUsd
   };
 }
 
@@ -244,7 +221,7 @@ async function getNextAnalysisVersion(req, propertyId) {
 }
 
 async function consumeQuota(req, eventType) {
-  const periodMonth = currentPeriodMonth();
+  const periodMonth = currentQuotaPeriodMonth();
   const { data, error } = await req.supabase.rpc('consume_ai_usage_quota', {
     p_organization_id: scopedOrganizationId(req.auth),
     p_period_month: periodMonth,
@@ -317,34 +294,19 @@ router.use((req, res, next) => {
 });
 
 router.get('/quota', async (req, res) => {
-  const periodMonth = currentPeriodMonth();
-  const { data: quotaRows, error: quotaError } = await req.supabase.rpc('ensure_ai_usage_quota', {
-    p_organization_id: scopedOrganizationId(req.auth),
-    p_period_month: periodMonth,
-    p_default_limit: DEFAULT_MONTHLY_UNITS
+  const { data, error } = await fetchAiQuotaSnapshot({
+    supabase: req.supabase,
+    auth: req.auth,
+    defaultMonthlyUnits: DEFAULT_MONTHLY_UNITS
   });
 
-  if (quotaError) {
+  if (error) {
     return respondError(res, 500, 'AI_QUOTA_FETCH_FAILED', 'Failed to fetch AI quota.', {
-      supabase_error: quotaError.message
-    });
-  }
-  const quota = Array.isArray(quotaRows) ? quotaRows[0] : quotaRows;
-
-  let eventsQuery = req.supabase
-    .from('ai_usage_events')
-    .select('units,estimated_cost_usd')
-    .eq('period_month', periodMonth);
-  eventsQuery = applyDemoReadScope(eventsQuery, req.auth, 'organization_id');
-  const { data: events, error: eventsError } = await eventsQuery;
-
-  if (eventsError) {
-    return respondError(res, 500, 'AI_USAGE_EVENTS_FETCH_FAILED', 'Failed to fetch AI usage events.', {
-      supabase_error: eventsError.message
+      supabase_error: error.message
     });
   }
 
-  return respondOk(res, quotaDto(quota, events ?? []));
+  return respondOk(res, data);
 });
 
 router.post('/analyses', async (req, res) => {

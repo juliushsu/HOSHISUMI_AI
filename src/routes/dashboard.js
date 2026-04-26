@@ -1,15 +1,10 @@
 import { Router } from 'express';
 import { respondError, respondOk } from '../lib/http.js';
+import { DEFAULT_MONTHLY_UNITS, fetchAiQuotaSnapshot } from '../services/aiQuota.js';
 import { DEMO_VISIBLE_DATA_TYPES, isDemoAuth, scopedOrganizationId } from '../services/demoScope.js';
 
 const DASHBOARD_EVENT_TYPES = new Set(['deal', 'birthday', 'ranking', 'announce']);
 const DASHBOARD_EVENT_EDIT_ROLES = new Set(['owner', 'super_admin', 'manager', 'store_manager', 'store_editor']);
-
-const AI_USAGE_LIMIT_BY_PLAN = {
-  basic: 5000,
-  pro: 30000,
-  ai: 100000
-};
 
 const ACTIVITY_PRIORITY_RANK = {
   high: 3,
@@ -451,7 +446,7 @@ router.get('/summary', async (req, res) => {
     managementCasesCountResult,
     vacancyCountResult,
     managementEventsThisMonthCountResult,
-    aiUsageResult,
+    aiQuotaResult,
     recentClientsResult,
     recentPropertiesResult,
     recentLeadsResult,
@@ -500,13 +495,11 @@ router.get('/summary', async (req, res) => {
       .select('*', { count: 'exact', head: true })
       .eq('organization_id', organizationId)
       .gte('event_date', monthStartIso),
-    scopeDemoType(
-      supabase
-      .from('ai_usage_logs')
-      .select('tokens_used')
-      .eq('organization_id', organizationId)
-      .gte('created_at', monthStartIso)
-    ),
+    fetchAiQuotaSnapshot({
+      supabase,
+      auth,
+      defaultMonthlyUnits: DEFAULT_MONTHLY_UNITS
+    }),
     scopeDemoType(
       supabase
       .from('clients')
@@ -556,7 +549,7 @@ router.get('/summary', async (req, res) => {
     managementCasesCountResult.error ||
     vacancyCountResult.error ||
     managementEventsThisMonthCountResult.error ||
-    aiUsageResult.error ||
+    aiQuotaResult.error ||
     recentClientsResult.error ||
     recentPropertiesResult.error ||
     recentLeadsResult.error ||
@@ -572,7 +565,7 @@ router.get('/summary', async (req, res) => {
       management_cases_error: managementCasesCountResult.error?.message ?? null,
       vacancy_count_error: vacancyCountResult.error?.message ?? null,
       management_events_this_month_error: managementEventsThisMonthCountResult.error?.message ?? null,
-      ai_usage_error: aiUsageResult.error?.message ?? null,
+      ai_usage_error: aiQuotaResult.error?.message ?? null,
       recent_clients_error: recentClientsResult.error?.message ?? null,
       recent_properties_error: recentPropertiesResult.error?.message ?? null,
       recent_leads_error: recentLeadsResult.error?.message ?? null,
@@ -581,13 +574,10 @@ router.get('/summary', async (req, res) => {
     });
   }
 
-  const aiUsageThisMonth = (aiUsageResult.data ?? []).reduce(
-    (sum, row) => sum + Number(row.tokens_used ?? 0),
-    0
-  );
   const planType = organizationResult.data?.plan_type ?? 'basic';
-  const aiUsageLimit = AI_USAGE_LIMIT_BY_PLAN[planType] ?? 0;
-  const aiUsageRemaining = Math.max(aiUsageLimit - aiUsageThisMonth, 0);
+  const aiUsageThisMonth = Number(aiQuotaResult.data?.used_units ?? 0);
+  const aiUsageLimit = Number(aiQuotaResult.data?.monthly_unit_limit ?? 0);
+  const aiUsageRemaining = Number(aiQuotaResult.data?.remaining_units ?? 0);
 
   const agentIds = Array.from(
     new Set([
@@ -728,6 +718,7 @@ router.get('/summary', async (req, res) => {
       ai_usage_this_month: aiUsageThisMonth,
       ai_usage_limit: aiUsageLimit,
       ai_usage_remaining: aiUsageRemaining,
+      ai_quota: aiQuotaResult.data,
       recent_activities: activities
     },
     200,
