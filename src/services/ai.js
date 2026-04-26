@@ -449,32 +449,38 @@ function detectRentalOccupancy(property = {}) {
 function buildOpeningLine(property = {}, context = {}) {
   const title = context.title || property.title || '這間物件';
   if (context.country === 'jp' && context.listing_mode === 'rental') {
-    return `${title} 這類離車站不遠、又有租賃條件可參考的日本小宅，通常很容易進入買方的比較名單。`;
+    const transit = normalizeText(context.transit) || '交通資訊仍在補充中';
+    const rentLine = context.rent_jpy != null ? `月租金約 ${formatJpy(context.rent_jpy)}` : '租賃條件可再確認';
+    const occupancyLine = context.is_occupied_rental ? '目前帶租約' : '目前已有租賃條件可參考';
+    if (transit === '交通資訊仍在補充中') {
+      return `${title} 現在是 ${occupancyLine}、${rentLine} 的日本小宅，對想先看收租節奏的買方來說很容易有感。`;
+    }
+    return `${title} 走到${transit}、${occupancyLine}、${rentLine}，第一眼就會吸引正在找日本收租小宅的買方。`;
   }
   if (context.country === 'jp') {
-    return `${title} 這類日本住宅，通常會先看地段條件、持有節奏與長期配置價值。`;
+    return `${title} 放在日本住宅裡看，會先吸引在意地段、持有節奏與長期配置的人。`;
   }
-  return `${title} 這類型物件，通常會先從生活機能、空間感與自住舒適度開始吸引買方。`;
+  return `${title} 通常會先用生活機能、空間感與自住舒適度吸引買方。`;
 }
 
 function buildPositioningLine(context = {}) {
   const transit = normalizeText(context.transit) || '交通資訊仍在補充中';
   if (context.country === 'jp' && context.listing_mode === 'rental') {
     if (transit === '交通資訊仍在補充中') {
-      return '交通資訊仍在補充中，現階段先用出租定位與長期持有節奏來看會比較有方向。';
+      return '交通資訊還在補，但先從出租定位與長期持有的角度看，方向已經很清楚。';
     }
-    return `從${transit}來看，交通便利性與出租定位都已有初步討論空間。`;
+    return `${transit} 這個條件，對想找市區收租小宅的買方來說，接受度通常不低。`;
   }
   if (context.country === 'jp') {
     if (transit === '交通資訊仍在補充中') {
-      return '交通資訊仍在補充中，適合先從區位條件與持有規劃切入。';
+      return '交通資訊還在補，先從區位條件與持有規劃看會比較準。';
     }
-    return `從${transit}來看，區位條件已具備基本吸引力，適合從持有規劃切入。`;
+    return `${transit} 這個條件，已經能先抓到區位吸引力。`;
   }
   if (transit === '交通資訊仍在補充中') {
-    return '交通資訊仍在補充中，生活圈與自住便利性仍可先作為主要溝通重點。';
+    return '交通資訊還在補，但生活圈與自住便利性還是能先抓重點。';
   }
-  return `從${transit}來看，生活圈與自住便利性會是主要溝通重點。`;
+  return `${transit} 這個條件，生活圈與自住便利性都不難想像。`;
 }
 
 function buildPropertyConditionLine(property = {}, context = {}) {
@@ -514,15 +520,25 @@ function buildAssessmentLine(context = {}) {
   }
 
   if (context.listing_mode === 'rental' && context.rent_jpy != null) {
-    return `現階段先以月租金、屋況與持有條件做初步評估；等總價與完整持有成本補齊後，再做投報試算會更準。`;
+    return '現在先看月租金、屋況與持有條件就夠了；等總價與完整持有成本補齊後，再把投報試算補上會更準。';
   }
 
-  return `目前可先從屋況條件與生活圈做初步判斷；價格與交易條件補齊後，再進一步比較會更穩健。`;
+  return '現在先看屋況條件與生活圈就能先做一輪篩選；價格與交易條件補齊後，再比會更穩。';
 }
 
 function buildComplianceAndCtaLine(narrative = {}, promptContext = {}) {
   const cta = normalizeText(promptContext.cta) || narrative.lines.cta;
   return `${narrative.lines.compliance} ${cta}`.trim();
+}
+
+function buildBuyerScenarioLine(narrative = {}) {
+  if (narrative.country === 'jp' && narrative.listing_mode === 'rental') {
+    return '單身租客或都心收租型買方通常會比較有感。';
+  }
+  if (narrative.country === 'jp') {
+    return '重視長期持有節奏的買方通常會先留意。';
+  }
+  return '重視生活機能與自住感的人通常會比較有感。';
 }
 
 function buildNarrativeTransform(property = {}, analysis = {}) {
@@ -584,7 +600,10 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
   const openingLine = buildOpeningLine(property, {
     title,
     country,
-    listing_mode: listingMode
+    listing_mode: listingMode,
+    transit: locationNarrative.transit_line,
+    rent_jpy: rentJpy,
+    is_occupied_rental: isOccupiedRental
   });
   const positioningLine = country === 'jp'
     ? `屬於${listingMode === 'rental' ? '都心收租' : '日本住宅'}導向產品，主要適合 ${targetBuyer}。`
@@ -621,6 +640,10 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
     area_label: areaValue != null ? `專有面積約 ${areaValue}㎡` : '',
     built_year: buildingInfo.built_year,
     building_label: buildingInfo.label,
+    buyer_scenario: buildBuyerScenarioLine({
+      country,
+      listing_mode: listingMode
+    }),
     short_risk: shortRisk,
     price_jpy: priceJpy,
     rent_jpy: rentJpy,
@@ -638,7 +661,7 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
       positioning: positioningLine,
       positioning_natural: positioningNaturalLine,
       value: normalizedValuePoint || (country === 'jp'
-        ? '這類小坪數產品通常會以穩定出租與持有彈性作為主要賣點。'
+        ? '小坪數、好出租、持有彈性高，通常就是這種物件最直接的吸引力。'
         : '重點會放在生活圈、空間感與自住使用情境。'),
       transit: locationNarrative.transit_line,
       lifestyle: locationNarrative.lifestyle_line,
@@ -695,14 +718,11 @@ function buildIgNarrativeCopy(narrative, promptContext = {}) {
   const bullets = uniqueTextLines([
     narrative.lines.transit === '交通資訊仍在補充中' ? '交通資訊補充中' : narrative.lines.transit,
     narrative.rent_jpy != null ? `月租金約 ${formatJpy(narrative.rent_jpy)}` : '',
-    narrative.price_jpy != null ? `總價約 ${formatJpy(narrative.price_jpy)}` : '',
-    narrative.layout ? `格局 ${narrative.layout}` : '',
-    narrative.area_label,
-    narrative.building_label,
-    narrative.lines.value,
+    narrative.buyer_scenario,
     narrative.listing_mode === 'rental'
-      ? '先看出租定位與持有條件'
+      ? '先看出租節奏與持有條件'
       : '可再補價格做完整比較',
+    narrative.building_label,
     `提醒：${narrative.short_risk}`
   ])
     .map((item) => item.length > 40 ? `${item.slice(0, 38)}…` : item)
@@ -722,6 +742,7 @@ function buildLineNarrativeCopy(narrative, promptContext = {}) {
   const cta = normalizeText(promptContext.cta) || '如果你要，我可以直接整理完整資料和比較表給你。';
   return [
     `${narrative.title} 這間我會先建議你放進比較清單。`,
+    `如果你是想先找日本收租型小宅的買方，我會建議先把這間留下來。`,
     narrative.lines.positioning_natural,
     narrative.lines.conditions,
     narrative.lines.assessment,
