@@ -358,6 +358,113 @@ function buildYieldNarrative(priceJpy, rentJpy, explicitGrossYield = null) {
   };
 }
 
+function extractBuiltYear(property = {}) {
+  return [
+    property.built_year,
+    property.construction_year,
+    property.year_built,
+    property.completion_year
+  ].map((value) => normalizeNullableNumber(value)).find((value) => value != null) ?? null;
+}
+
+function formatCompletionLine(property = {}) {
+  const builtYear = extractBuiltYear(property);
+  return builtYear != null ? `${builtYear} 年完工` : '';
+}
+
+function formatAreaLine(property = {}) {
+  const areaSqm = normalizeNullableNumber(property.area_sqm ?? property.exclusive_area_sqm ?? property.building_area_sqm);
+  return areaSqm != null ? `專有面積約 ${areaSqm} 平方公尺` : '';
+}
+
+function buildAudienceLine(country = 'jp') {
+  if (country === 'jp') {
+    return '適合第一次買日本物件、想穩定收租，或想找低總價入門的買方。';
+  }
+  return '適合重視生活機能、自住感與空間使用順手度的買方。';
+}
+
+function buildCustomerYieldLine(narrative) {
+  if (narrative.gross_yield_pct != null) {
+    return `若以月租金與總價一起看，表面投報率約 ${narrative.gross_yield_pct}% 左右，對重視收益節奏的買方會更有感。`;
+  }
+  if (narrative.rent_jpy != null) {
+    return '若您想進一步評估收益，我們可以協助整理月租、持有成本與同區物件比較。';
+  }
+  return '若您想進一步比較，我們可以協助整理同區物件、持有成本與交易條件。';
+}
+
+function buildCustomerRiskLine() {
+  return '實際屋況、權狀、貸款條件與交易成本，我們會協助逐項確認，讓評估更安心。';
+}
+
+function buildCustomerCta(promptContext = {}) {
+  return normalizeText(promptContext.cta) || '想看完整資料，我幫你抓 2–3 間一起比，也可以直接整理比較表給你。';
+}
+
+function cleanSentence(sentence) {
+  return normalizeText(sentence)
+    .replace(/\s+/g, ' ')
+    .replace(/\s([，。！？])/g, '$1')
+    .trim();
+}
+
+function dedupeSentences(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const normalized = cleanSentence(item);
+    if (!normalized) return false;
+    if (seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+}
+
+function clampIgBullet(text, maxLength = 18) {
+  const normalized = cleanSentence(text).replace(/[。！!？?]$/g, '');
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function sanitizeCustomerFacingCopy(text, fallbackText = '') {
+  const replacementRisk = buildCustomerRiskLine();
+  const replacementYield = '若您想進一步評估收益，我們可以協助整理月租、持有成本與同區物件比較。';
+
+  let output = normalizeText(text);
+  if (!output) output = normalizeText(fallbackText);
+
+  output = output
+    .replace(/避免宣稱保證增值、保證出租或穩賺不賠。?/g, replacementRisk)
+    .replace(/不應/g, '')
+    .replace(/先用[^。！？\n]*切入。?/g, '')
+    .replace(/等[^。！？\n]*補齊後[^。！？\n]*。?/g, replacementYield)
+    .replace(/投報試算補上會更準。?/g, replacementYield)
+    .replace(/仍需逐項確認。?/g, '我們會協助逐項確認，讓評估更安心。')
+    .replace(/資料待補。?/g, '歡迎私訊，我們可以協助補充查詢。')
+    .replace(/無法驗證/g, '可再協助查核')
+    .replace(/保守評估/g, '先從已知條件開始比較')
+    .replace(/現在先看/g, '目前可以先從')
+    .replace(/\n{3,}/g, '\n\n');
+
+  const forbiddenFragments = [
+    '避免宣稱',
+    '不應',
+    '先用',
+    '補齊後',
+    '投報試算補上會更準',
+    '仍需逐項確認',
+    '資料待補',
+    '無法驗證',
+    '保守評估'
+  ];
+
+  if (forbiddenFragments.some((fragment) => output.includes(fragment)) && fallbackText) {
+    output = normalizeText(fallbackText);
+  }
+
+  return output.trim();
+}
+
 function buildNarrativeTransform(property = {}, analysis = {}) {
   const legacyAnalysis = normalizeLegacyAnalysis(analysis);
   const enrichedAnalysis = normalizeEnrichedAnalysis(analysis);
@@ -368,6 +475,9 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
   const yieldNarrative = buildYieldNarrative(priceJpy, rentJpy, enrichedAnalysis.gross_yield_pct);
   const locationNarrative = buildLocationNarrative(property, analysis);
   const title = property.title_zh || property.title || property.title_ja || '精選物件';
+  const completionLine = formatCompletionLine(property);
+  const areaLine = formatAreaLine(property);
+  const layoutLine = normalizeText(property.layout) ? `格局 ${property.layout}` : '';
   const targetBuyer = pickFirstText(
     enrichedAnalysis.fit_types[0],
     enrichedAnalysis.buyer_personas[0],
@@ -428,6 +538,19 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
       risk: riskLine,
       compliance: complianceLine,
       cta
+    },
+    facts: {
+      audience: buildAudienceLine(country),
+      layout: layoutLine,
+      area: areaLine,
+      completion: completionLine,
+      rent: rentJpy != null ? `月租金約 ¥${rentJpy.toLocaleString()}` : '',
+      property_condition: dedupeSentences([
+        rentJpy != null ? `目前帶租約，${`月租金約 ¥${rentJpy.toLocaleString()}`}` : '',
+        layoutLine,
+        areaLine,
+        completionLine
+      ])
     }
   };
 }
@@ -456,35 +579,44 @@ function buildCopyMeta({ analysis = {}, promptContext = {}, usage = {} } = {}) {
 }
 
 function buildFbNarrativeCopy(narrative, promptContext = {}) {
-  const cta = normalizeText(promptContext.cta) || narrative.lines.cta;
-  return [
-    narrative.lines.opening,
+  const cta = buildCustomerCta(promptContext);
+  const opening = cleanSentence(
+    `${narrative.title} ${narrative.lines.transit}、${narrative.facts.rent || '物件條件清楚'}，很容易吸引正在找${narrative.country === 'jp' ? '日本收租型小宅' : '生活感自住物件'}的買方。`
+  );
+  const middle = cleanSentence(
     [
-      narrative.lines.positioning,
-      narrative.lines.value,
-      narrative.lines.transit,
-      narrative.lines.lifestyle
-    ].join(' '),
-    narrative.lines.yield,
-    `風險提醒：${narrative.lines.risk}`,
-    `${narrative.lines.compliance}\n${cta}`
-  ].join('\n\n');
+      narrative.facts.audience,
+      '這種可以先放進比較。',
+      narrative.lines.value
+    ].join(' ')
+  );
+  const facts = cleanSentence(
+    dedupeSentences([
+      narrative.facts.property_condition.join('，')
+    ]).join(' ')
+  );
+  const value = cleanSentence(buildCustomerYieldLine(narrative));
+  const close = cleanSentence(`${buildCustomerRiskLine()} ${cta}`);
+
+  return [opening, middle, facts, value, close].filter(Boolean).join('\n\n');
 }
 
 function buildIgNarrativeCopy(narrative, promptContext = {}) {
-  const cta = normalizeText(promptContext.cta) || narrative.lines.cta || '想看完整資料，直接私訊我。';
-  const bullets = [
-    narrative.lines.positioning,
-    narrative.lines.value,
-    narrative.lines.transit,
-    narrative.lines.lifestyle,
-    narrative.lines.yield,
-    `提醒：${narrative.lines.risk}`
-  ].slice(0, 5);
+  const cta = normalizeText(promptContext.cta) || '私訊我，我幫你整理比較表。';
+  const bullets = dedupeSentences([
+    narrative.lines.transit.replace(/，步行約 /g, '步行約'),
+    narrative.facts.rent,
+    narrative.country === 'jp' ? '適合第一次入門' : '適合自住首購',
+    narrative.country === 'jp' ? '想穩定收租可看' : '重視生活機能可看',
+    narrative.facts.layout ? narrative.facts.layout.replace('格局 ', '') : '',
+    narrative.facts.completion
+  ])
+    .slice(0, 5)
+    .map((item) => `• ${clampIgBullet(item)}`);
 
   return [
     narrative.title,
-    ...bullets.map((item) => `• ${item}`),
+    ...bullets,
     cta,
     narrative.country === 'jp'
       ? '#星澄地所 #日本不動產 #收租規劃 #資產配置'
@@ -493,48 +625,37 @@ function buildIgNarrativeCopy(narrative, promptContext = {}) {
 }
 
 function buildLineNarrativeCopy(narrative, promptContext = {}) {
-  const cta = normalizeText(promptContext.cta) || narrative.lines.cta || '如果你要，我可以直接整理完整資料和比較表給你。';
+  const cta = normalizeText(promptContext.cta) || '我幫你抓 2–3 間一起比，也可以直接整理比較表給你。';
   return [
-    `${narrative.title} 我先幫你抓重點。`,
-    narrative.lines.positioning,
-    narrative.lines.value,
-    narrative.lines.yield,
-    `提醒你先注意：${narrative.lines.risk}`,
-    cta
-  ].join('\n');
+    `${narrative.title} 這間我會建議放進比較清單。`,
+    `如果你是${narrative.country === 'jp' ? '第一次買日本物件、想穩定收租，或想找低總價入門' : '想找生活機能好、好入住的物件'}，這種可以先看。`,
+    cleanSentence(`${narrative.lines.transit}。`),
+    cleanSentence(dedupeSentences([narrative.facts.rent, narrative.facts.layout, narrative.facts.completion]).join('，')),
+    buildCustomerYieldLine(narrative),
+    `${buildCustomerRiskLine()} ${cta}`
+  ]
+    .map((line) => cleanSentence(line))
+    .filter(Boolean)
+    .slice(0, 6)
+    .join('\n');
 }
 
-function fallbackTranslate(input) {
-  const rawTitle = input.jp_title || input.title || '日本不動產物件';
-  const rawDescription = input.jp_description || input.description || '尚未提供完整日文描述。';
-
-  return {
-    result: {
-      title: `【JP物件】${rawTitle}`,
-      overview: `物件摘要：${rawDescription}`,
-      description: `完整介紹：${rawDescription}`,
-      highlights: [
-        '地段與交通條件是主要價值來源。',
-        '若租賃需求穩定，可提升現金流可預測性。',
-        '日圓資產可作為資產配置分散。'
-      ],
-      risk_notes: [
-        '需留意匯率波動對總報酬的影響。',
-        '跨境持有與稅務規範需由專業人士評估。',
-        '屋況與管理修繕成本可能影響淨收益。'
-      ],
-      cta: '想看完整投報與區域比較，回覆「我要完整分析」。'
-    },
-    tokensUsed: 0
+function buildCustomerFacingCopy(narrative, channel, promptContext = {}) {
+  const base = {
+    fb: buildFbNarrativeCopy(narrative, promptContext),
+    ig: buildIgNarrativeCopy(narrative, promptContext),
+    line: buildLineNarrativeCopy(narrative, promptContext)
   };
+  return sanitizeCustomerFacingCopy(base[channel] || base.fb, base[channel] || base.fb);
 }
 
 function fallbackGeneratePost(property) {
+  const narrative = buildNarrativeTransform(property, {});
   return {
     result: {
-      facebook_post: `【精選物件】${property.title}\n價格：${property.price}\n${property.description || ''}\n想看完整資料歡迎私訊。`,
-      instagram_post: `#星澄地所 #精選物件\n${property.title}\n${property.description || ''}\n價格 ${property.price}`,
-      line_message: `推薦你一間不錯的物件：${property.title}，價格 ${property.price}。想看完整資料我可以立刻傳你。`
+      facebook_post: buildCustomerFacingCopy(narrative, 'fb'),
+      instagram_post: buildCustomerFacingCopy(narrative, 'ig'),
+      line_message: buildCustomerFacingCopy(narrative, 'line')
     },
     tokensUsed: 0
   };
@@ -604,16 +725,12 @@ function fallbackAssistantAnalysis(property) {
 
 function fallbackAssistantCopy(property, analysis, channel, promptContext = {}) {
   const narrative = buildNarrativeTransform(property, analysis);
-  const base = {
-    fb: buildFbNarrativeCopy(narrative, promptContext),
-    ig: buildIgNarrativeCopy(narrative, promptContext),
-    line: buildLineNarrativeCopy(narrative, promptContext)
-  };
   const usage = fallbackUsage();
+  const text = buildCustomerFacingCopy(narrative, channel, promptContext);
 
   return {
     result: {
-      text: base[channel] || base.fb,
+      text,
       compliance_flags: normalizeComplianceFlags([
         {
           code: 'safe_ai_lite_mode',
@@ -626,6 +743,30 @@ function fallbackAssistantCopy(property, analysis, channel, promptContext = {}) 
     tokensUsed: 0,
     usage,
     meta: buildCopyMeta({ analysis, promptContext, usage })
+  };
+}
+function fallbackTranslate(input) {
+  const rawTitle = input.jp_title || input.title || '日本不動產物件';
+  const rawDescription = input.jp_description || input.description || '尚未提供完整日文描述。';
+
+  return {
+    result: {
+      title: `【JP物件】${rawTitle}`,
+      overview: `物件摘要：${rawDescription}`,
+      description: `完整介紹：${rawDescription}`,
+      highlights: [
+        '地段與交通條件是主要價值來源。',
+        '若租賃需求穩定，可提升現金流可預測性。',
+        '日圓資產可作為資產配置分散。'
+      ],
+      risk_notes: [
+        '需留意匯率波動對總報酬的影響。',
+        '跨境持有與稅務規範需由專業人士評估。',
+        '屋況與管理修繕成本可能影響淨收益。'
+      ],
+      cta: '想看完整投報與區域比較，回覆「我要完整分析」。'
+    },
+    tokensUsed: 0
   };
 }
 
@@ -735,9 +876,12 @@ export async function generateAssistantCopy({ property, analysis = null, channel
     }
   }, null, 2)}`;
   const { parsed, tokensUsed, usage } = await callOpenAI(systemPrompt, userPrompt);
+  const normalized = normalizeCopyShape(parsed);
+  const fallbackText = buildCustomerFacingCopy(narrative, channel, promptContext);
+  normalized.text = sanitizeCustomerFacingCopy(normalized.text, fallbackText);
 
   return {
-    result: normalizeCopyShape(parsed),
+    result: normalized,
     tokensUsed,
     usage,
     meta: buildCopyMeta({ analysis, promptContext, usage })
