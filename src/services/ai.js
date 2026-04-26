@@ -450,12 +450,11 @@ function buildOpeningLine(property = {}, context = {}) {
   const title = context.title || property.title || '這間物件';
   if (context.country === 'jp' && context.listing_mode === 'rental') {
     const transit = normalizeText(context.transit) || '交通資訊仍在補充中';
-    const rentLine = context.rent_jpy != null ? `月租金約 ${formatJpy(context.rent_jpy)}` : '租賃條件可再確認';
     const occupancyLine = context.is_occupied_rental ? '目前帶租約' : '目前已有租賃條件可參考';
     if (transit === '交通資訊仍在補充中') {
-      return `${title} 現在是 ${occupancyLine}、${rentLine} 的日本小宅，對想先看收租節奏的買方來說很容易有感。`;
+      return `${title} 現在是 ${occupancyLine} 的日本小宅，對想先看收租節奏的買方來說很容易有感。`;
     }
-    return `${title} 走到${transit}、${occupancyLine}、${rentLine}，第一眼就會吸引正在找日本收租小宅的買方。`;
+    return `${title} 走到${transit}、${occupancyLine}，第一眼就會吸引正在找日本收租小宅的買方。`;
   }
   if (context.country === 'jp') {
     return `${title} 放在日本住宅裡看，會先吸引在意地段、持有節奏與長期配置的人。`;
@@ -469,7 +468,7 @@ function buildPositioningLine(context = {}) {
     if (transit === '交通資訊仍在補充中') {
       return '交通資訊還在補，但先從出租定位與長期持有的角度看，方向已經很清楚。';
     }
-    return `${transit} 這個條件，對想找市區收租小宅的買方來說，接受度通常不低。`;
+    return `${transit} 這個條件，對想找市區收租小宅的買方來說，很容易先有感。`;
   }
   if (context.country === 'jp') {
     if (transit === '交通資訊仍在補充中') {
@@ -520,7 +519,7 @@ function buildAssessmentLine(context = {}) {
   }
 
   if (context.listing_mode === 'rental' && context.rent_jpy != null) {
-    return '現在先看月租金、屋況與持有條件就夠了；等總價與完整持有成本補齊後，再把投報試算補上會更準。';
+    return '現在先看月租金、屋況與持有條件；等總價與完整持有成本補齊後，再把投報試算補上會更準。';
   }
 
   return '現在先看屋況條件與生活圈就能先做一輪篩選；價格與交易條件補齊後，再比會更穩。';
@@ -531,14 +530,34 @@ function buildComplianceAndCtaLine(narrative = {}, promptContext = {}) {
   return `${narrative.lines.compliance} ${cta}`.trim();
 }
 
-function buildBuyerScenarioLine(narrative = {}) {
+function buildSuitableWhoLine(narrative = {}) {
   if (narrative.country === 'jp' && narrative.listing_mode === 'rental') {
-    return '單身租客或都心收租型買方通常會比較有感。';
+    return '如果你是第一次買日本物件，或想穩定收租，這間會很好理解。';
+  }
+  if (narrative.country === 'jp' && narrative.price_jpy != null) {
+    return '如果你是想找低總價入門的買方，這間可以先放進比較。';
+  }
+  return '如果你是重視生活機能與自住感的人，這間值得先留意。';
+}
+
+function buildActionLine(narrative = {}) {
+  if (narrative.country === 'jp' && narrative.listing_mode === 'rental') {
+    return '這種可以優先看。';
   }
   if (narrative.country === 'jp') {
-    return '重視長期持有節奏的買方通常會先留意。';
+    return '可以先放進比較。';
   }
-  return '重視生活機能與自住感的人通常會比較有感。';
+  return '我會建議你先看。';
+}
+
+function buildBuyerScenarioLine(narrative = {}) {
+  if (narrative.country === 'jp' && narrative.listing_mode === 'rental') {
+    return '適合第一次買日本物件';
+  }
+  if (narrative.country === 'jp') {
+    return '想找低總價入門';
+  }
+  return '重視生活機能的人';
 }
 
 function buildNarrativeTransform(property = {}, analysis = {}) {
@@ -591,7 +610,7 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
   const cta = pickFirstText(
     enrichedAnalysis.marketing_line[0],
     legacyAnalysis.communication_tips[0]
-  ) || '想看完整資料、比較表或安排進一步討論，歡迎直接私訊。';
+  ) || '我幫你抓 2–3 間一起比，也可以順手把比較表整理給你。';
   const complianceLine = pickFirstText(
     enrichedAnalysis.must_include[0],
     legacyAnalysis.compliance_notes[0]
@@ -641,6 +660,15 @@ function buildNarrativeTransform(property = {}, analysis = {}) {
     built_year: buildingInfo.built_year,
     building_label: buildingInfo.label,
     buyer_scenario: buildBuyerScenarioLine({
+      country,
+      listing_mode: listingMode
+    }),
+    suitable_who_line: buildSuitableWhoLine({
+      country,
+      listing_mode: listingMode,
+      price_jpy: priceJpy
+    }),
+    action_line: buildActionLine({
       country,
       listing_mode: listingMode
     }),
@@ -699,33 +727,31 @@ function buildCopyMeta({ analysis = {}, promptContext = {}, usage = {} } = {}) {
 }
 
 function buildFbNarrativeCopy(narrative, promptContext = {}) {
-  const complianceAndCta = buildComplianceAndCtaLine(narrative, promptContext);
+  const cta = normalizeText(promptContext.cta) || narrative.lines.cta;
   return [
     `${narrative.lines.opening} ${narrative.lines.value}`.trim(),
-    narrative.lines.positioning_natural,
+    `${narrative.suitable_who_line} ${narrative.action_line}`.trim(),
     narrative.lines.conditions,
-    narrative.lines.assessment,
-    `提醒你先留意：${narrative.lines.risk}`,
-    complianceAndCta
+    `${narrative.lines.assessment} 提醒你先留意：${narrative.lines.risk}`.trim(),
+    `${narrative.lines.compliance} ${cta}`.trim()
   ].join('\n\n');
 }
 
 function buildIgNarrativeCopy(narrative, promptContext = {}) {
-  const cta = normalizeText(promptContext.cta) || '想看完整資料，直接私訊我。';
+  const cta = normalizeText(promptContext.cta) || '我幫你整理比較表';
   const heading = narrative.country === 'jp'
     ? `${narrative.title}｜日本收租型物件`
     : `${narrative.title}｜生活圈精選`;
   const bullets = uniqueTextLines([
-    narrative.lines.transit === '交通資訊仍在補充中' ? '交通資訊補充中' : narrative.lines.transit,
+    narrative.lines.transit === '交通資訊仍在補充中' ? '交通資訊補充中' : narrative.lines.transit.replace('，步行約 ', '步行').replace(' 分鐘', '分'),
     narrative.rent_jpy != null ? `月租金約 ${formatJpy(narrative.rent_jpy)}` : '',
     narrative.buyer_scenario,
     narrative.listing_mode === 'rental'
-      ? '先看出租節奏與持有條件'
-      : '可再補價格做完整比較',
-    narrative.building_label,
-    `提醒：${narrative.short_risk}`
+      ? '想穩定收租可先看'
+      : '可以先放進比較',
+    narrative.country === 'jp' && narrative.price_jpy == null ? '可以先放進比較' : narrative.building_label
   ])
-    .map((item) => item.length > 40 ? `${item.slice(0, 38)}…` : item)
+    .map((item) => item.length > 18 ? `${item.slice(0, 18)}` : item)
     .slice(0, 5);
 
   return [
@@ -739,16 +765,17 @@ function buildIgNarrativeCopy(narrative, promptContext = {}) {
 }
 
 function buildLineNarrativeCopy(narrative, promptContext = {}) {
-  const cta = normalizeText(promptContext.cta) || '如果你要，我可以直接整理完整資料和比較表給你。';
+  const cta = normalizeText(promptContext.cta) || '我幫你抓 2–3 間一起比，會更快看出差別。';
   return [
     `${narrative.title} 這間我會先建議你放進比較清單。`,
-    `如果你是想先找日本收租型小宅的買方，我會建議先把這間留下來。`,
-    narrative.lines.positioning_natural,
-    narrative.lines.conditions,
+    `${narrative.suitable_who_line} ${narrative.action_line}`.trim(),
+    narrative.lines.transit === '交通資訊仍在補充中'
+      ? '交通資訊還在補，但目前帶租約。'
+      : `${narrative.lines.transit}，目前帶租約。`,
+    `${narrative.rent_jpy != null ? `月租金約 ${formatJpy(narrative.rent_jpy)}，` : ''}${narrative.building_label || ''}`.replace(/，$/, '。'),
     narrative.lines.assessment,
-    `先提醒你：${narrative.lines.risk}`,
-    cta
-  ].join('\n');
+    `先提醒你：${narrative.lines.risk} ${cta}`.trim()
+  ].slice(0, 6).join('\n');
 }
 
 function fallbackTranslate(input) {
