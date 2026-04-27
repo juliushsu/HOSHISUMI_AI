@@ -231,6 +231,13 @@ function withSentenceEnding(text) {
   return /[。！？!?]$/.test(normalized) ? normalized : `${normalized}。`;
 }
 
+function sanitizeSourceNarrative(text) {
+  const normalized = cleanText(text, 500);
+  if (!normalized) return null;
+  if (/\bstaging\b|\bowner_test\b|\bstaging_test\b|\bdemo\b/i.test(normalized)) return null;
+  return normalized;
+}
+
 function extractLocationHighlights(locationEnrichment) {
   const source = safeObject(locationEnrichment);
   const candidates = [];
@@ -377,13 +384,13 @@ function buildSalesDirectorFacts(property, analysis = null, promptContext = {}) 
     propertyRawPayload.built_year,
     propertyRawPayload.building_built_year
   );
-  const description = pickFirstText(
+  const description = sanitizeSourceNarrative(pickFirstText(
     property?.description_zh,
     property?.master_description_zh,
     property?.description,
     property?.description_ja,
     property?.master_description_ja
-  );
+  ));
   const address = pickFirstText(property?.address_zh, property?.master_address_zh, property?.city, property?.district);
   const lifestyleHighlights = extractLocationHighlights(locationEnrichment);
   const sanitizedAnalysis = sanitizeAnalysis(analysis);
@@ -477,7 +484,7 @@ function buildJapanFbCopy(facts) {
         : '如果你重視的是資產配置的穩定感，近站、總價帶清楚、好理解的產品，往往比花俏題材更容易長期持有。';
 
   const suitableBuyers = '這類物件特別適合想做海外資產配置、偏好東京或大阪等成熟生活圈，或正在找出租與轉手都相對好理解標的的買方。也因為條件清楚，和家人或資金夥伴討論時更容易快速形成共識。';
-  const closing = '如果你想要，我可以直接幫你整理同區比較、租賃條件和持有成本，讓你更快判斷這間值不值得進下一輪。';
+  const closing = '如果你想要，我可以直接幫你整理同區比較、租賃條件和持有成本，讓你更快判斷這間值不值得進下一輪。這種案子在決策時，通常也比只靠題材的產品更讓人安心。';
 
   return sanitizeCopyText(`${opening}。\n\n${middle ? `${middle}。` : ''}${withSentenceEnding(facts.description)}\n\n${incomeStory}\n\n${suitableBuyers}\n${closing}`);
 }
@@ -493,10 +500,10 @@ function buildTaiwanFbCopy(facts) {
   const lifestyle = facts.lifestyle_highlights.length > 0
     ? `周邊條件像是${facts.lifestyle_highlights.join('、')}，都很適合拿來想像日常生活。`
     : '看這類物件時，最有感的通常不是單一數字，而是通勤、採買、收納與家人互動都能不能順。';
-  const suitableBuyers = '如果你是首購、正在換屋，或希望找一間兼顧自住感與未來保值性的產品，這種生活圈成熟、格局清楚的案子很值得安排一趟現場。真正到現場時，通常會比照片更容易感受到它的動線和生活感。';
+  const suitableBuyers = '如果你是首購、正在換屋，或希望找一間兼顧自住感與未來保值性的產品，這種生活圈成熟、格局清楚的案子很值得安排一趟現場。真正到現場時，通常會比照片更容易感受到它的動線和生活感；如果是帶著家人一起找房，這種條件清楚的案子也更容易快速形成共識。';
   const closing = facts.price_display
-    ? `總價約${facts.price_display}。想要的話，我可以再幫你把同生活圈的捷運、學區和價格帶整理成一張比較表。`
-    : '想要的話，我可以再幫你把同生活圈的捷運、學區和價格帶整理成一張比較表。';
+    ? `總價約${facts.price_display}。想要的話，我可以再幫你把同生活圈的捷運、學區和價格帶整理成一張比較表，連貸款和換屋節奏也一起幫你抓。`
+    : '想要的話，我可以再幫你把同生活圈的捷運、學區和價格帶整理成一張比較表，連貸款和換屋節奏也一起幫你抓。';
 
   return sanitizeCopyText(`${opening}\n\n${middle ? `${middle}。` : ''}${withSentenceEnding(facts.description)}\n${lifestyle}\n\n${suitableBuyers}\n${closing}`);
 }
