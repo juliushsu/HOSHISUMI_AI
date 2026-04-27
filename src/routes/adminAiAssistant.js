@@ -52,8 +52,28 @@ const PROPERTY_SNAPSHOT_SELECT = [
   'cover_image_url',
   'floorplan_image_url',
   'gallery_urls',
+  'raw_source_payload',
   'updated_at',
   'created_at'
+].join(',');
+
+const PARTNER_MASTER_SELECT = [
+  'id',
+  'source_partner_id',
+  'source_property_ref',
+  'title_ja',
+  'title_zh',
+  'address_ja',
+  'address_zh',
+  'price',
+  'currency',
+  'layout',
+  'area_sqm',
+  'description_ja',
+  'description_zh',
+  'image_urls',
+  'canonical_payload_json',
+  'raw_source_payload'
 ].join(',');
 
 const ANALYSIS_SELECT = [
@@ -169,6 +189,75 @@ function toSnapshot(property) {
   };
 }
 
+function normalizeMarketingStatusFromMetadata(metadata) {
+  const rawValue = metadata?.marketing_status;
+  if (typeof rawValue !== 'string') return null;
+  const normalized = rawValue.trim();
+  return normalized || null;
+}
+
+async function enrichPropertyForCopy(req, property) {
+  if (!property?.id) return property;
+
+  const tenantOrganizationId = scopedOrganizationId(req.auth);
+  const { data: bindingRow, error: bindingError } = await req.supabase
+    .from('tenant_property_bindings')
+    .select('id,property_master_id,linked_property_id,metadata_json')
+    .eq('organization_id', tenantOrganizationId)
+    .eq('linked_property_id', property.id)
+    .maybeSingle();
+
+  if (bindingError) {
+    throw new Error(`Failed to fetch tenant_property_binding context: ${bindingError.message}`);
+  }
+
+  if (!bindingRow?.property_master_id) {
+    return {
+      ...property,
+      property_source_type: 'tenant',
+      property_master_id: null,
+      tenant_property_binding_id: bindingRow?.id ?? null,
+      source_partner_id: null,
+      marketing_status: normalizeMarketingStatusFromMetadata(bindingRow?.metadata_json),
+      canonical_payload_json: null,
+      property_master_raw_source_payload: null
+    };
+  }
+
+  const { data: masterRow, error: masterError } = await req.supabase
+    .from('properties_master')
+    .select(PARTNER_MASTER_SELECT)
+    .eq('id', bindingRow.property_master_id)
+    .maybeSingle();
+
+  if (masterError) {
+    throw new Error(`Failed to fetch properties_master context: ${masterError.message}`);
+  }
+
+  return {
+    ...property,
+    property_source_type: masterRow ? 'partner' : 'tenant',
+    property_master_id: bindingRow.property_master_id ?? null,
+    tenant_property_binding_id: bindingRow.id ?? null,
+    source_partner_id: masterRow?.source_partner_id ?? null,
+    marketing_status: normalizeMarketingStatusFromMetadata(bindingRow.metadata_json),
+    canonical_payload_json: masterRow?.canonical_payload_json ?? null,
+    property_master_raw_source_payload: masterRow?.raw_source_payload ?? null,
+    source_property_ref: masterRow?.source_property_ref ?? property.source_ref ?? null,
+    master_title_ja: masterRow?.title_ja ?? null,
+    master_title_zh: masterRow?.title_zh ?? null,
+    master_address_ja: masterRow?.address_ja ?? null,
+    master_address_zh: masterRow?.address_zh ?? null,
+    master_price: masterRow?.price ?? null,
+    master_currency: masterRow?.currency ?? null,
+    master_layout: masterRow?.layout ?? null,
+    master_area_sqm: masterRow?.area_sqm ?? null,
+    master_description_ja: masterRow?.description_ja ?? null,
+    master_description_zh: masterRow?.description_zh ?? null,
+    master_image_urls: masterRow?.image_urls ?? []
+  };
+}
+
 async function fetchProperty(req, propertyId) {
   const { supabase, auth } = req;
   let query = supabase
@@ -192,7 +281,18 @@ async function fetchProperty(req, propertyId) {
     return { ok: false, status: 404, code: 'PROPERTY_NOT_FOUND', message: 'Property not found.' };
   }
 
-  return { ok: true, property: data };
+  try {
+    const enriched = await enrichPropertyForCopy(req, data);
+    return { ok: true, property: enriched };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 500,
+      code: 'PROPERTY_CONTEXT_FETCH_FAILED',
+      message: 'Failed to enrich property copy context.',
+      details: { message: error instanceof Error ? error.message : 'Unknown property context error.' }
+    };
+  }
 }
 
 async function fetchActiveAnalysis(req, propertyId) {
